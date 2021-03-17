@@ -1,0 +1,23 @@
+<launch>
+
+<param name="map_path" value="/home/freicar/freicar_ws/src/freicar_base/freicar_map/maps/freicar_1.aismap" />
+
+<node pkg="image_transport" type="republish" name="decompressor" output="screen" args="compressed in:=/freicar_1/sim/camera/rgb/front/image raw out:=/freicar_1/sim/camera/rgb/front/image"/>
+
+<node pkg="freicar_sign_detect" type="freicar_sign_detect_node" name="sign_detector" output="screen"/>
+
+<node pkg="freicar_map" type="freicar_map_node" name="freicar_map" output="screen"/>
+
+	<arg name="evaluate" default="true" />
+	<arg name="use_lane_regression" default="false" />
+
+	<node name="freicar_localization" pkg="freicar_localization" type="freicar_localization_node" respawn="false" output="screen">
+		<param name="evaluate"  type="bool" value="$(arg evaluate)" />
+		<param name="use_lane_regression"       type="bool" value="$(arg use_lane_regression)" />
+	</node>
+
+<node pkg="rosbag" type="play" name="player" launch-prefix="bash -c 'sleep 20.0; $0 $@' " args="--clock $(find freicar_localization)/loc_bags/freicar_loc_2.bag">
+  </node>
+
+</launch>
+

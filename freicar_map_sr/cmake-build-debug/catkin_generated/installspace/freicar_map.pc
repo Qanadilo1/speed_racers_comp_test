@@ -1,0 +1,8 @@
+prefix=/usr/local
+
+Name: freicar_map
+Description: Description of freicar_map
+Version: 0.0.0
+Cflags: -I${prefix}/include
+Libs: -L${prefix}/lib -lfreicar_globalmap -lfreicar_map_framework
+Requires: roscpp roslib visualization_msgs freicar_common raiscar_msgs

@@ -1,0 +1,10 @@
+<launch>
+ <!-- freicar_map node-->
+  <node pkg="freicar_map" type="freicar_map_node" name="sim"/>
+
+ <!-- joy node -->
+  <node respawn="true" pkg="joy" type="joy_node" name="rl_joy" >
+    <param name="dev" type="string" value="/dev/input/js0" />
+	<!-- <param name="deadzone" value="0.12" /> -->
+  </node>
+</launch>

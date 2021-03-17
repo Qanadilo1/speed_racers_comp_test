@@ -1,0 +1,8 @@
+prefix=/home/freicar/freicar_ws/src/freicar_base/freicar_map/cmake-build-debug/devel
+
+Name: freicar_map
+Description: Description of freicar_map
+Version: 0.0.0
+Cflags: -I/home/freicar/freicar_ws/src/freicar_base/freicar_map/include -I/home/freicar/freicar_ws/src/freicar_base/freicar_map/MapThrift -I/home/freicar/freicar_ws/src/freicar_base/freicar_map/MapCore/include
+Libs: -L${prefix}/lib -lfreicar_globalmap -lfreicar_map_framework
+Requires: roscpp roslib visualization_msgs freicar_common raiscar_msgs

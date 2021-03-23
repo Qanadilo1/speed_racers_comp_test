@@ -22,7 +22,9 @@
 
 #include <visualization_msgs/MarkerArray.h>
 #include "std_msgs/Bool.h"
-#include "yaml.h"
+//HERE CHANGE//
+#include "yaml-cpp/yaml.h"
+//STOP CHANGE //
 
 
 #include <tf2_ros/transform_listener.h>
@@ -203,7 +205,24 @@ int main(int argc, char **argv)
     ROS_INFO("map framework node started...");
 
 //    goal_reached = node_handle->subscribe("freicar_1/goal_reached", 1, callback_goal_reached,);
+	//HERE CHANGE
+    std::string mapname;
+    node_handle->getParam("map_path", mapname);
+    std::string file_name_cut = mapname.substr(59,100);
+    int nch = file_name_cut.size();
+    std::string real_name =  file_name_cut.substr(0,nch-7);
+    std::cout << real_name << std::endl;
+    std::string file_yaml = "/home/freicar/freicar_ws/src/freicar_base/freicar_launch/spawn_positions/" +real_name + "_spawn.yaml";
+    std::cout << file_yaml << std::endl;
+//    goal_reached = node_handle->subscribe("freicar_1/goal_reached", 1, callback_goal_reached,);
 
+    YAML::Node base = YAML::LoadFile(file_yaml);
+    YAML::Node pose_node = base["spawn_pose"];
+    const float spawn_x = pose_node["x"].as<float>();
+    const float spawn_y = pose_node["y"].as<float>();
+    const float spawn_z = pose_node["z"].as<float>();
+    const float spawn_heading = pose_node["heading"].as<float>();
+    //HERE STOP CHANGE
 
 
 
@@ -215,7 +234,7 @@ int main(int argc, char **argv)
     bool new_map = false;
     //std::string filename = ros::package::getPath("freicar_map") + "/maps/thriftmap_fix.aismap";
     std::string filename;
-
+	
     std::cout <<"print map: "<<std::endl;
 
     std::cout << ros::param::get("/map_path", filename)<<std::endl;

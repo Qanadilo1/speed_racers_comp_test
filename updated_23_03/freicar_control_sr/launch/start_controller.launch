@@ -1,0 +1,39 @@
+<!-- creates a sim_only agent -->
+<launch>
+  <!-- necessary params -->
+  <arg name="name" default="freicar_1"/>
+  <arg name="tf_name" default="freicar_1"/>
+  <!-- agent node args -->
+  <!-- control args -->
+  <arg name="wheelbase" default="0.36"/>
+  <arg name="position_tolerance" default="0.1"/>
+  <arg name="steering_angle_limit" default="1.22173"/>
+  <arg name="desired_velocity" default="2.0"/>
+  <arg name="vmax" default="5.0"/>
+  <arg name="throttle_limit" default="0.25"/>
+  <arg name="curvature_vel_limit_factor" default="0.44"/>
+  <arg name="steering_vel_limit_factor" default="2.0"/>
+  <arg name="distance_vel_limit_factor" default="0.3"/>
+  <arg name="minimum_throttle_limit" default="0.1"/>
+
+  <remap from="path_segment" to="$(arg name)/path_segment"/>
+  <remap from="goal_reached" to="$(arg name)/goal_reached"/>
+  <remap from="control" to="$(arg name)/control"/>
+
+  <remap from="odometry" to="$(arg name)/odometry"/>
+
+  <node pkg="freicar_control_sr" type="pure_pursuit" name="$(arg name)_freicar_controller" output="screen">
+    <param name="robot_frame_id" value="$(arg tf_name)"/>
+    <param name="tracker_frame_id" value="$(arg tf_name)"/>
+    <param name="wheelbase" value="$(arg wheelbase)"/>
+    <param name="position_tolerance" value="$(arg position_tolerance)"/>
+    <param name="steering_angle_limit" value="$(arg steering_angle_limit)"/>
+    <param name="desired_velocity" value="$(arg desired_velocity)"/>
+    <param name="vmax" value="$(arg vmax)"/>
+    <param name="throttle_limit" value="$(arg throttle_limit)"/>
+    <param name="curvature_vel_limit_factor" value="$(arg curvature_vel_limit_factor)"/>
+    <param name="steering_vel_limit_factor" value="$(arg steering_vel_limit_factor)"/>
+    <param name="distance_vel_limit_factor" value="$(arg distance_vel_limit_factor)"/>
+    <param name="minimum_throttle_limit" value="$(arg minimum_throttle_limit)"/>
+  </node>
+</launch>

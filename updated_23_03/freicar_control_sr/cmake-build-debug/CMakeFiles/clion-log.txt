@@ -1,0 +1,51 @@
+/opt/clion-2020.2.4/bin/cmake/linux/bin/cmake -DCMAKE_BUILD_TYPE=Debug -DCATKIN_DEVEL_PREFIX:PATH=/home/freicar/freicar_ws/devel. -G "CodeBlocks - Unix Makefiles" /home/freicar/freicar_ws/src/speed_racers_comp_test/freicar_control_sr
+-- The C compiler identification is GNU 9.3.0
+-- The CXX compiler identification is GNU 9.3.0
+-- Check for working C compiler: /usr/bin/cc
+-- Check for working C compiler: /usr/bin/cc - works
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Check for working CXX compiler: /usr/bin/c++
+-- Check for working CXX compiler: /usr/bin/c++ - works
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Using CATKIN_DEVEL_PREFIX: /home/freicar/freicar_ws/devel.
+-- Using CMAKE_PREFIX_PATH: /home/freicar/freicar_ws/devel;/opt/ros/noetic
+-- This workspace overlays: /home/freicar/freicar_ws/devel;/opt/ros/noetic
+-- Found PythonInterp: /usr/bin/python3 (found suitable version "3.8.5", minimum required is "3") 
+-- Using PYTHON_EXECUTABLE: /usr/bin/python3
+-- Using Debian Python package layout
+-- Found PY_em: /usr/lib/python3/dist-packages/em.py  
+-- Using empy: /usr/lib/python3/dist-packages/em.py
+-- Using CATKIN_ENABLE_TESTING: ON
+-- Call enable_testing()
+-- Using CATKIN_TEST_RESULTS_DIR: /home/freicar/freicar_ws/src/speed_racers_comp_test/freicar_control_sr/cmake-build-debug/test_results
+-- Forcing gtest/gmock from source, though one was otherwise available.
+-- Found gtest sources under '/usr/src/googletest': gtests will be built
+-- Found gmock sources under '/usr/src/googletest': gmock will be built
+-- Found PythonInterp: /usr/bin/python3 (found version "3.8.5") 
+-- Found Threads: TRUE  
+-- Using Python nosetests: /usr/bin/nosetests3
+-- catkin 0.8.9
+-- BUILD_SHARED_LIBS is on
+Traceback (most recent call last):
+  File "/home/freicar/freicar_ws/src/speed_racers_comp_test/freicar_control_sr/cmake-build-debug/catkin_generated/generate_cached_setup.py", line 30, in <module>
+    os.chmod(output_filename, mode | stat.S_IXUSR)
+PermissionError: [Errno 1] Operation not permitted: '/home/freicar/freicar_ws/src/speed_racers_comp_test/freicar_control_sr/cmake-build-debug/catkin_generated/setup_cached.sh'
+CMake Error at /opt/ros/noetic/share/catkin/cmake/safe_execute_process.cmake:11 (message):
+  execute_process(/usr/bin/python3
+  "/home/freicar/freicar_ws/src/speed_racers_comp_test/freicar_control_sr/cmake-build-debug/catkin_generated/generate_cached_setup.py")
+  returned error code 1
+Call Stack (most recent call first):
+  /opt/ros/noetic/share/catkin/cmake/all.cmake:208 (safe_execute_process)
+  /opt/ros/noetic/share/catkin/cmake/catkinConfig.cmake:20 (include)
+  CMakeLists.txt:10 (find_package)
+
+
+-- Configuring incomplete, errors occurred!
+See also "/home/freicar/freicar_ws/src/speed_racers_comp_test/freicar_control_sr/cmake-build-debug/CMakeFiles/CMakeOutput.log".
+See also "/home/freicar/freicar_ws/src/speed_racers_comp_test/freicar_control_sr/cmake-build-debug/CMakeFiles/CMakeError.log".

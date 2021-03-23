@@ -1,0 +1,15 @@
+<!-- creates a sim_only agent -->
+<launch>
+  <!-- necessary params -->
+  <arg name="name" default="freicar_1"/>
+
+
+  <remap from="control" to="$(arg name)/control"/>
+  <node pkg="freicar_joy" type="freicar_joy_node" name="$(arg name)_joy" output="screen">
+     <param name="~controller_type" value="xbox360" />
+  </node>
+  <node pkg="joy" type="joy_node" name="$(arg name)_joy_node" output="screen" > 
+  </node>
+
+
+</launch>

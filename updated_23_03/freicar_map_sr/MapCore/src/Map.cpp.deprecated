@@ -1,0 +1,2966 @@
+
+/******************************************************************************
+ * Audi Autonomous Driving Cup 2018
+ * Team frAIsers
+ * AUTHOR: Fabien Jenne
+ *
+ * Singleton class for the Map
+ *
+******************************************************************************/
+
+
+/* function to generate a global waypoint given the current car pose. Assumes standard driving
+    ARGUMENTS:
+        pose - the car pose in world map coordinates (in cm). 0,0 is at the map pivot position
+        waypoint_distance - the euclidean distance to the next waypoint (in cm)
+*/
+mapobjects::GlobalWaypoint Map::getNextGlobalWaypoint(
+    const mapobjects::Pose& pose, double waypoint_distance,
+    bool ignoreStoplines, bool ignoreCrosswalks, bool ignoreParking) {
+    if (waypoint_debug) std::cout << "*** MapWaypoint: searching next waypoint from pose ***" \
+        << std::endl;
+
+    mapobjects::GlobalWaypoint waypoint = mapobjects::GlobalWaypoint(
+        mapobjects::WaypointType::ERROR);
+
+    if (waypoint_debug) std::cout << "MapWaypoint: pivot pos / cm (absolute): " \
+        << map_pivot.getX() << "   " << map_pivot.getY() << std::endl;
+    if (waypoint_debug) std::cout << "MapWaypoint: search pos / cm (relative) " \
+        << pose.getX() << "   " << pose.getY() << std::endl;
+
+    // get the nearest lanepoint
+    //   convert the pose to the pivot independent pose
+    mapobjects::Pose pose_abs = mapobjects::Pose(
+        getAbsoluteX(pose.getX()), getAbsoluteY(pose.getY()), pose.getZ(), pose.getT());
+    if (waypoint_debug) std::cout << "MapWaypoint: search pos / cm (absolute) " \
+        << pose_abs.getX() << "   " << pose_abs.getY() << std::endl;
+
+    // enters CRITICAL section
+    std::lock_guard<std::mutex> guard(map_data_access);
+
+    // get the initial lanepoint
+    mapobjects::LanePoint3D lp_start = getNearestLanePoint(pose_abs);
+    if (geometry_debug) drawLanePoint(lp_start, 4, false, true);
+
+    return globalWaypointSearch(lp_start, waypoint_distance,
+        ignoreStoplines, ignoreCrosswalks, ignoreParking);
+}
+
+/* function to get the interpolated lanepoint given the next lanepoint
+   and a negative offset from that lanepoint.
+*/
+mapobjects::LanePoint3D Map::getInterpolatedLanePoint(
+    const mapobjects::LanePoint3D& lp_next, const double& offset) {
+    if (lanepoint_debug) std::cout << "MapLanePoint: interpolating new point" << std::endl;
+
+    double current_lane_offset = getOffsetAlongLane(lp_next);
+
+    mapobjects::Point3D lp_p_interpolated = getPoint3DFromLaneOffset(
+        lp_next,
+        current_lane_offset + offset);
+    mapobjects::LanePoint3D lp_interpolated = lp_next;
+    lp_interpolated.p = lp_p_interpolated;
+    // use the previous point as reference (such that getLanePointDirection works)
+    if (!lp_next.isInterpolated) {
+        if (lp_next.p_index > 0) {
+            lp_interpolated.p_index--;
+        }
+    } else {
+        lp_interpolated.p_index = lp_next.p_index;
+    }
+    lp_interpolated.isInterpolated = true;
+    lp_interpolated.lp_type = determineLanePointType(lp_interpolated, false);
+    lp_interpolated.lane_info = getLaneInfo(lp_interpolated.lane_uuid);
+    return lp_interpolated;
+}
+
+/* function to generate a global waypoint given the current car pose. Assumes standard driving.
+   Throws error if position difference between current pose and given lanepoint exceeds threshold.
+    ARGUMENTS:
+        pose - the car pose in world map coordinates (in cm). 0,0 is at the map pivot position
+        lp - the lanepoint of the previous waypoint for planning purposes
+        waypoint_distance - the euclidean distance to the next waypoint (in cm)
+*/
+/* mapobjects::GlobalWaypoint Map::getNextGlobalWaypoint(
+    const mapobjects::Pose& pose, const mapobjects::LanePoint3D& lp, double waypoint_distance,
+    bool ignoreStoplines, bool ignoreCrosswalks, bool ignoreParking) {
+    // check if delocalized
+    if (mapobjects::Point3D(pose.getX(), pose.getY(), pose.getZ()).computeDistance(lp.p) \
+        > DELOCALIZATION_THRESHOLD) {
+        throw mapobjects::WaypointException::POSE_POSITION_MISMATCH;
+    }
+    return getNextGlobalWaypoint(
+        pose, waypoint_distance, ignoreStoplines, ignoreCrosswalks, ignoreParking);
+} */
+
+/* function to generate a global waypoint given the current car pose. Assumes standard driving.
+   This function does not locate the car in the map.
+   It uses the lanepoint information to determine the position.
+    ARGUMENTS:
+        lp - The lanepoint is used to find the next waypoint on the road specified by the lanepoint
+        waypoint_distance - the euclidean distance to the next waypoint (in cm)
+*/
+mapobjects::GlobalWaypoint Map::getNextGlobalWaypoint(
+    const mapobjects::LanePoint3D& lp, double waypoint_distance,
+    bool ignoreStoplines, bool ignoreCrosswalks, bool ignoreParking) {
+    if (waypoint_debug) std::cout << "*** MapWaypoint: searching next waypoint from lp ***" \
+        << std::endl;
+    mapobjects::GlobalWaypoint waypoint = mapobjects::GlobalWaypoint(
+        mapobjects::WaypointType::ERROR);
+
+    // enters CRITICAL section
+    std::lock_guard<std::mutex> guard(map_data_access);
+
+    mapobjects::LanePoint3D lp_start = lp;
+    if (geometry_debug) drawLanePoint(lp_start, 4, false, true);
+
+    mapobjects::GlobalWaypoint wp = globalWaypointSearch(lp_start, waypoint_distance,
+        ignoreStoplines, ignoreCrosswalks, ignoreParking);
+    return wp;
+}
+
+/* core function to search for the newest waypoint on the map */
+mapobjects::GlobalWaypoint Map::globalWaypointSearch(
+    const mapobjects::LanePoint3D& lp_start, double waypoint_distance,
+    bool ignoreStoplines, bool ignoreCrosswalks, bool ignoreParking) {
+    mapobjects::GlobalWaypoint waypoint = mapobjects::GlobalWaypoint(
+        mapobjects::WaypointType::ERROR);
+
+    // initialize search
+    double distance_to_waypoint = 0.0;
+    mapobjects::LanePoint3D lp_waypoint = lp_start;
+    mapobjects::LanePoint3D lp_waypoint_next;
+
+    if (waypoint_debug) std::cout << "*** MapWaypoint: staring waypoint search ***" << std::endl;
+    if (waypoint_debug) std::cout << "MapWaypoint: goal waypoint distance / cm: " \
+        << waypoint_distance << std::endl;
+    if (waypoint_debug) std::cout << "MapWaypoint: starting waypoint search" << std::endl;
+
+    bool skip_search = false;
+    if (lp_waypoint.lp_type.type == mapobjects::WaypointType::JUNCTION) {
+        if (waypoint_debug) std::cout << "MapWaypoint: waypoint is junction" << std::endl;
+        if (waypoint_debug) std::cout << "MapWaypoint: skipping waypoint search" << std::endl;
+        lp_waypoint_next = lp_waypoint;
+        waypoint.type = mapobjects::WaypointType::JUNCTION;
+        skip_search = true;
+    }
+
+    // get the next lanepoint until goal distance or abortion criterion reached
+    while ((distance_to_waypoint < waypoint_distance) && !skip_search) {
+        // get the next lanepoint on the current lane
+        lp_waypoint_next = getNextLanePoint(lp_waypoint, 0);
+        if (geometry_debug) drawLanePoint(lp_waypoint_next, 2, false);
+
+        // update the distance measure
+        //   use line length as distance measure (replace += with = for euclidean)
+        //   this should also implicitly handle the case if first waypoint is interpolatede
+        distance_to_waypoint += lp_waypoint.p.computeDistance(lp_waypoint_next.p);
+
+        if (waypoint_debug) std::cout << "MapWaypoint: current waypoint distance / cm: " \
+            << distance_to_waypoint << std::endl;
+
+        // check if desired distance is reached. Search exits automatically in next iteration
+        if (distance_to_waypoint >= waypoint_distance) {
+            if (waypoint_debug) std::cout \
+                << "MapWaypoint: waypoint distance exceeded. Interpolating" << std::endl;
+
+            // interpolate and set type
+            double distance_difference = waypoint_distance - distance_to_waypoint;  // negative
+
+            if (waypoint_debug) std::cout \
+                << "MapWaypoint: interpolated distance: " \
+                << distance_to_waypoint + distance_difference << std::endl;
+
+            lp_waypoint_next = getInterpolatedLanePoint(lp_waypoint_next, distance_difference);
+            skip_search = true;
+        }
+
+        // intermediate goal check, exit search if positive
+        if (lp_waypoint_next.lp_type.type == mapobjects::WaypointType::ERROR) {
+            std::cout << "MapWaypoint: waypoint is ERROR_TYPE *****" << std::endl;
+            break;
+        } else if (lp_waypoint_next.lp_type.type == mapobjects::WaypointType::DEADEND) {
+            if (waypoint_debug) std::cout << "MapWaypoint: waypoint is deadend" << std::endl;
+            waypoint.type = mapobjects::WaypointType::DEADEND;
+            break;
+        } else if (lp_waypoint_next.lp_type.type == mapobjects::WaypointType::CROSSWALK) {
+            if (waypoint_debug) std::cout << "MapWaypoint: waypoint is crosswalk" << std::endl;
+            if (!ignoreCrosswalks) {
+                waypoint.type = mapobjects::WaypointType::CROSSWALK;
+                double crosswalk_offset = lp_waypoint_next.lp_type.offset;
+                lp_waypoint_next = getInterpolatedLanePoint(
+                    lp_waypoint_next, crosswalk_offset - getOffsetAlongLane(lp_waypoint_next));
+                lp_waypoint_next.lp_type.type = mapobjects::WaypointType::CROSSWALK;
+
+                if (waypoint_debug) std::cout << "MapWaypoint: stopping waypoint search" \
+                    << std::endl;
+                break;
+            }
+            if (waypoint_debug) std::cout << "MapWaypoint: proceeding search" << std::endl;
+            waypoint.type = mapobjects::WaypointType::CROSSWALK;
+        } else if (lp_waypoint_next.lp_type.type == mapobjects::WaypointType::STOPLINE) {
+            if (waypoint_debug) std::cout << "MapWaypoint: waypoint is stopline" << std::endl;
+            if (!ignoreStoplines) {
+                waypoint.type = mapobjects::WaypointType::STOPLINE;
+                double stopline_offset = lp_waypoint_next.lp_type.offset;
+                lp_waypoint_next = getInterpolatedLanePoint(
+                    lp_waypoint_next, stopline_offset - getOffsetAlongLane(lp_waypoint_next));
+                lp_waypoint_next.lp_type.type = mapobjects::WaypointType::STOPLINE;
+
+                if (waypoint_debug) std::cout << "MapWaypoint: stopping waypoint search" \
+                    << std::endl;
+
+                break;
+            }
+            if (waypoint_debug) std::cout << "MapWaypoint: proceeding search" << std::endl;
+            waypoint.type = mapobjects::WaypointType::STOPLINE;
+        } else if (lp_waypoint_next.lp_type.type == mapobjects::WaypointType::JUNCTION) {
+            if (waypoint_debug) std::cout << "MapWaypoint: waypoint is junction" << std::endl;
+            if (waypoint_debug) std::cout << "MapWaypoint: stopping waypoint search" << std::endl;
+            waypoint.type = mapobjects::WaypointType::JUNCTION;
+            break;
+        } else if (lp_waypoint_next.lp_type.type == mapobjects::WaypointType::PARKING) {
+            if (waypoint_debug) std::cout << "MapWaypoint: waypoint is parking" << std::endl;
+            if (!ignoreParking) {
+                waypoint.type = mapobjects::WaypointType::PARKING;
+                if (waypoint_debug) std::cout << "MapWaypoint: stopping waypoint search" \
+                    << std::endl;
+                break;
+            }
+            if (waypoint_debug) std::cout << "MapWaypoint: proceeding search" << std::endl;
+        } else {
+            waypoint.type = mapobjects::WaypointType::ROAD;
+            if (waypoint_debug) std::cout \
+                << "MapWaypoint: intermediate waypoint is road" << std::endl;
+        }
+
+        // move forward one lanepoint
+        lp_waypoint = lp_waypoint_next;
+    }
+
+    // create a waypoint from the found lanepoint
+
+    waypoint.pose = mapobjects::Pose(
+        getRelativePoint3D(lp_waypoint_next.p),
+        getLanePointDirection(lp_waypoint_next));
+    waypoint.lp = lp_waypoint_next;
+
+    if (waypoint_debug) {
+        std::cout << "MapWaypoint: waypoint position (x,y) / cm:\t" \
+            << (waypoint.pose.getX()) << "   "<< (waypoint.pose.getY()) << std::endl;
+        std::cout << "MapWaypoint: returning waypoint" << std::endl;
+    }
+
+    // indicate if the car is on the wrong lane
+    if (lp_start.isOppositeLane) {
+        waypoint.isOppositeLane = true;
+    }
+
+    if (waypoint_debug) std::cout << "*** MapWaypoint: returning from search ***" << std::endl;
+    return waypoint;
+}
+
+/* function to return the given waypoint on the opposite lane.
+   throws error if opposite lane does not exist.
+*/
+mapobjects::GlobalWaypoint Map::getWaypointOnOppositeLane(
+    const mapobjects::GlobalWaypoint& wp, bool invertHeading = false) {
+    mapobjects::LanePoint3D lp_opposite = getNearestOppositeLanePoint(wp.lp);
+    if (lp_opposite.lane_uuid.equals(wp.lp.lane_uuid)) {
+        std::cout << "MapWaypoint: ERROR: getWaypointOnOppositeLane(): no opposite lane found"
+            << std::endl;
+        throw mapobjects::WaypointException::NO_OPPOSITE_LANE;
+    }
+    double lp_opposite_direction = wp.pose.getT();
+    if (!invertHeading) {
+        lp_opposite_direction = getLanePointDirection(lp_opposite);
+    }
+    return mapobjects::GlobalWaypoint(
+        lp_opposite,
+        mapobjects::WaypointType::OPPOSITE_ROAD,
+        mapobjects::Pose(
+            getRelativePoint3D(lp_opposite.p),
+            lp_opposite_direction));
+}
+
+/* function to get the first point on the new lane after turning left.
+   Throws error if not possible.
+    ARGUMENTS:
+        lp - the lanepoint before the junction. Type has to be JUNCTION.
+*/
+std::vector<mapobjects::GlobalWaypoint> Map::getWaypointsTurnLeft(mapobjects::LanePoint3D lp) {
+    std::vector<mapobjects::GlobalWaypoint> waypoints = std::vector<mapobjects::GlobalWaypoint>();
+    mapobjects::GlobalWaypoint waypoint = mapobjects::GlobalWaypoint(lp);
+    if (junction_debug) std::cout \
+        << "*** MapWaypoint: searching waypoint: turn left ***" << std::endl;
+
+    // get the outgoing lanes of the lane before the junction
+    std::vector<mapobjects::Uuid> lane_connections_out = \
+        getRealConnectionsOut(getLaneFromLaneUuid(lp.lane_uuid));
+    int n_connections_out = lane_connections_out.size();
+    if (junction_debug) std::cout << "MapWaypoint: outgoing connections: " \
+        << n_connections_out << std::endl;
+
+    // analyze junction
+
+    // check if lanepoint connects to junction
+    if (n_connections_out < 1) {
+        // deadend
+        if (junction_debug) std::cout << "MapWaypoint: no outgoing connections" << std::endl;
+        throw mapobjects::WaypointException::NO_OUTGOING_CONNECTIONS;
+
+
+    // not a real junction. return first point on the next road
+    } else if (n_connections_out == 1) {
+        if (junction_debug) std::cout << "MapWaypoint: one outgoing connection" << std::endl;
+        mapobjects::LanePoint3D lp_out = getFirstLanePoint(getNextLaneUuid(lp.lane_uuid));
+        waypoint.lp = lp_out;
+        waypoint.type = lp_out.lp_type.type;
+        waypoint.pose = mapobjects::Pose(
+            getRelativePoint3D(lp_out.p),
+            getLanePointDirection(lp_out));
+        waypoints.push_back(waypoint);
+
+
+    // T-junction of some sort. check if "turn left" makes sense or throw error
+    } else if (n_connections_out == 2) {
+        if (junction_debug) std::cout << "MapWaypoint: 2 outgoing connections" << std::endl;
+        // incoming road
+        double heading_junction_in = getLanePointDirection(lp);
+        if (geometry_debug) drawLanePoint(lp, 2, true);
+
+        // outgoing lane 1
+        mapobjects::LanePoint3D lp_out_1 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[0]));
+        double heading_out_1 = getLanePointDirection(lp_out_1);
+        bool turn_left_1_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_1, 2, true);
+
+        // outgoing lane 2
+        mapobjects::LanePoint3D lp_out_2 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[1]));
+        double heading_out_2 = getLanePointDirection(lp_out_2);
+        bool turn_left_2_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_2, 2, true);
+
+        // compare the headings
+        double heading_to_out_1 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_1);
+        double heading_to_out_2 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_2);
+
+        if ((heading_to_out_1 > (JUNCTION_LEFT_ANGLE - JUNCTION_LEFT_MARGIN)) &&
+            (heading_to_out_1 < (JUNCTION_LEFT_ANGLE + JUNCTION_LEFT_MARGIN))) {
+            // turn left is valid for outgoing lane 1
+            turn_left_1_valid = true;
+        }
+        if ((heading_to_out_2 > (JUNCTION_LEFT_ANGLE - JUNCTION_LEFT_MARGIN)) &&
+            (heading_to_out_2 < (JUNCTION_LEFT_ANGLE + JUNCTION_LEFT_MARGIN))) {
+            // turn left is valid for outgoing lane 2
+            turn_left_2_valid = true;
+        }
+
+        if (junction_debug) {
+            std::cout << "MapWaypoint: lp headings:\t1: " \
+                << heading_junction_in << "\t2: " << heading_out_1 << "\t3: " \
+                << heading_out_2 << std::endl;
+            std::cout << "MapWaypoint: headings:\t1: " \
+                << heading_to_out_1 << "\t2: " << heading_to_out_2 << std::endl;
+            std::cout << "MapWaypoint: valid?:\t1: " \
+                << turn_left_1_valid << "\t2: " << turn_left_2_valid << std::endl;
+        }
+
+        // create the waypoint or throw error
+        if (turn_left_1_valid && turn_left_2_valid) {
+            // both are turn lefts
+            throw mapobjects::WaypointException::MULTIPLE_TURN_LEFT_DETECTED;
+        } else if (turn_left_1_valid) {
+            // lane 1 is TURN_LEFT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[0]);
+            waypoint.lp = lp_out_1;
+            waypoint.type = determineLanePointType(lp_out_1, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_1.p),
+                getLanePointDirection(lp_out_1));
+            waypoints.push_back(waypoint);
+        } else if (turn_left_2_valid) {
+            // lane 2 is TURN_LEFT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[1]);
+            waypoint.lp = lp_out_2;
+            waypoint.type = determineLanePointType(lp_out_2, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_2.p),
+                getLanePointDirection(lp_out_2));
+            waypoints.push_back(waypoint);
+        } else {
+            throw mapobjects::WaypointException::NO_TURN_LEFT_DETECTED;
+        }
+
+
+    // full junction with four roads
+    } else if (n_connections_out == 3) {
+        if (junction_debug) std::cout << "MapWaypoint: 3 outgoing connections" << std::endl;
+        // incoming road
+        double heading_junction_in = getLanePointDirection(lp);
+        if (geometry_debug) drawLanePoint(lp, 2, true);
+
+        // outgoing lane 1
+        mapobjects::LanePoint3D lp_out_1 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[0]));
+        double heading_out_1 = getLanePointDirection(lp_out_1);
+        bool turn_left_1_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_1, 2, true);
+
+        // outgoing lane 2
+        mapobjects::LanePoint3D lp_out_2 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[1]));
+        double heading_out_2 = getLanePointDirection(lp_out_2);
+        bool turn_left_2_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_2, 2, true);
+
+        // outgoing lane 3
+        mapobjects::LanePoint3D lp_out_3 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[2]));
+        double heading_out_3 = getLanePointDirection(lp_out_3);
+        bool turn_left_3_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_3, 2, true);
+
+        // compare the headings
+        double heading_to_out_1 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_1);
+        double heading_to_out_2 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_2);
+        double heading_to_out_3 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_3);
+
+        if ((heading_to_out_1 > (JUNCTION_LEFT_ANGLE - JUNCTION_LEFT_MARGIN)) &&
+            (heading_to_out_1 < (JUNCTION_LEFT_ANGLE + JUNCTION_LEFT_MARGIN))) {
+            // turn left is valid for outgoing lane 1
+            turn_left_1_valid = true;
+        }
+        if ((heading_to_out_2 > (JUNCTION_LEFT_ANGLE - JUNCTION_LEFT_MARGIN)) &&
+            (heading_to_out_2 < (JUNCTION_LEFT_ANGLE + JUNCTION_LEFT_MARGIN))) {
+            // turn left is valid for outgoing lane 2
+            turn_left_2_valid = true;
+        }
+        if ((heading_to_out_3 > (JUNCTION_LEFT_ANGLE - JUNCTION_LEFT_MARGIN)) &&
+            (heading_to_out_3 < (JUNCTION_LEFT_ANGLE + JUNCTION_LEFT_MARGIN))) {
+            // turn left is valid for outgoing lane 3
+            turn_left_3_valid = true;
+        }
+
+        if (junction_debug) {
+            std::cout << "MapWaypoint: lp headings:\t1: " \
+                << heading_junction_in << "\t2: " << heading_out_1 << "\t3: " \
+                << heading_out_2 << "\t4: " \
+                << heading_out_3 << std::endl;
+            std::cout << "MapWaypoint: headings:\t1: " \
+                << heading_to_out_1 << "\t2: " << heading_to_out_2 << "\t3: " \
+                << heading_to_out_3 << std::endl;
+            std::cout << "MapWaypoint: valid?:\t1: " \
+                << turn_left_1_valid << "\t2: " << turn_left_2_valid << "\t3: " \
+                << turn_left_3_valid << std::endl;
+        }
+
+        // create the waypoint or throw error
+        if ((turn_left_1_valid && turn_left_2_valid) ||
+            (turn_left_1_valid && turn_left_3_valid) ||
+            (turn_left_2_valid && turn_left_3_valid)) {
+            // more than one turn left
+            throw mapobjects::WaypointException::MULTIPLE_TURN_LEFT_DETECTED;
+        } else if (turn_left_1_valid) {
+            // lane 1 is TURN_LEFT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[0]);
+            waypoint.lp = lp_out_1;
+            waypoint.type = determineLanePointType(lp_out_1, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_1.p),
+                getLanePointDirection(lp_out_1));
+            waypoints.push_back(waypoint);
+        } else if (turn_left_2_valid) {
+            // lane 2 is TURN_LEFT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[1]);
+            waypoint.lp = lp_out_2;
+            waypoint.type = determineLanePointType(lp_out_2, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_2.p),
+                getLanePointDirection(lp_out_2));
+            waypoints.push_back(waypoint);
+        } else if (turn_left_3_valid) {
+            // lane 3 is TURN_LEFT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[2]);
+            waypoint.lp = lp_out_3;
+            waypoint.type = determineLanePointType(lp_out_3, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_3.p),
+                getLanePointDirection(lp_out_3));
+            waypoints.push_back(waypoint);
+        } else {
+            if (junction_debug) std::cout << "MapWaypoint: no turn left detected" << std::endl;
+            throw mapobjects::WaypointException::NO_TURN_LEFT_DETECTED;
+        }
+
+
+    // more than 3 outgoing connections
+    } else {
+        // throw not implemented error
+        if (junction_debug) std::cout \
+            << "MapWaypoint: more than 3 outgoing connections" << std::endl;
+        throw mapobjects::WaypointException::MORE_THAN_3_OUTGOING_CONNECTIONS;
+    }
+
+    // return the waypoints
+    return waypoints;
+}
+
+/* function to get the first point on the new lane after turning left.
+   Throws error if not possible.
+    ARGUMENTS:
+        lp - the lanepoint before the junction. Type has to be JUNCTION.
+*/
+mapobjects::GlobalWaypoint Map::getWaypointTurnLeft(mapobjects::LanePoint3D lp) {
+    return getWaypointsTurnLeft(lp).back();
+}
+
+/* function to get the first point on the new lane after turning right.
+   Throws error if not possible.
+    ARGUMENTS:
+        lp - the lanepoint before the junction. Type has to be JUNCTION.
+*/
+std::vector<mapobjects::GlobalWaypoint> Map::getWaypointsTurnRight(mapobjects::LanePoint3D lp) {
+    std::vector<mapobjects::GlobalWaypoint> waypoints = std::vector<mapobjects::GlobalWaypoint>();
+    mapobjects::GlobalWaypoint waypoint = mapobjects::GlobalWaypoint(lp);
+    if (junction_debug) std::cout \
+        << "*** MapWaypoint: searching waypoint: turn right ***" << std::endl;
+
+    // get the outgoing lanes of the lane before the junction
+    std::vector<mapobjects::Uuid> lane_connections_out = \
+        getRealConnectionsOut(getLaneFromLaneUuid(lp.lane_uuid));
+    int n_connections_out = lane_connections_out.size();
+    if (junction_debug) std::cout << "MapWaypoint: outgoing connections: " \
+        << n_connections_out << std::endl;
+
+    // analyze junction
+
+    // check if lanepoint connects to junction
+    if (n_connections_out < 1) {
+        // deadend
+        if (junction_debug) std::cout << "MapWaypoint: no outgoing connections" << std::endl;
+        throw mapobjects::WaypointException::NO_OUTGOING_CONNECTIONS;
+
+
+    // not a real junction. return first point on the next road
+    } else if (n_connections_out == 1) {
+        if (junction_debug) std::cout << "MapWaypoint: one outgoing connection" << std::endl;
+        mapobjects::LanePoint3D lp_out = getFirstLanePoint(getNextLaneUuid(lp.lane_uuid));
+        waypoint.lp = lp_out;
+        waypoint.type = determineLanePointType(lp_out, false).type;
+        waypoint.pose = mapobjects::Pose(
+            getRelativePoint3D(lp_out.p),
+            getLanePointDirection(lp_out));
+        waypoints.push_back(waypoint);
+
+
+    // T-junction of some sort. check if "turn right" makes sense or throw error
+    } else if (n_connections_out == 2) {
+        if (junction_debug) std::cout << "MapWaypoint: 2 outgoing connections" << std::endl;
+        // incoming road
+        double heading_junction_in = getLanePointDirection(lp);
+        if (geometry_debug) drawLanePoint(lp, 2, true);
+
+        // outgoing lane 1
+        mapobjects::LanePoint3D lp_out_1 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[0]));
+        double heading_out_1 = getLanePointDirection(lp_out_1);
+        bool turn_right_1_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_1, 2, true);
+
+        // outgoing lane 2
+        mapobjects::LanePoint3D lp_out_2 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[1]));
+        double heading_out_2 = getLanePointDirection(lp_out_2);
+        bool turn_right_2_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_2, 2, true);
+
+        // compare the headings
+        double heading_to_out_1 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_1);
+        double heading_to_out_2 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_2);
+
+        if ((heading_to_out_1 > (JUNCTION_RIGHT_ANGLE - JUNCTION_RIGHT_MARGIN)) &&
+            (heading_to_out_1 < (JUNCTION_RIGHT_ANGLE + JUNCTION_RIGHT_MARGIN))) {
+            // turn right is valid for outgoing lane 1
+            turn_right_1_valid = true;
+        }
+        if ((heading_to_out_2 > (JUNCTION_RIGHT_ANGLE - JUNCTION_RIGHT_MARGIN)) &&
+            (heading_to_out_2 < (JUNCTION_RIGHT_ANGLE + JUNCTION_RIGHT_MARGIN))) {
+            // turn right is valid for outgoing lane 2
+            turn_right_2_valid = true;
+        }
+
+        if (junction_debug) {
+            std::cout << "MapWaypoint: lp headings:\t1: " \
+                << heading_junction_in << "\t2: " << heading_out_1 << "\t3: " \
+                << heading_out_2 << std::endl;
+            std::cout << "MapWaypoint: headings:\t1: " \
+                << heading_to_out_1 << "\t2: " << heading_to_out_2 << std::endl;
+            std::cout << "MapWaypoint: valid?:\t1: " \
+                << turn_right_1_valid << "\t2: " << turn_right_2_valid << std::endl;
+        }
+
+        // create the waypoint or throw error
+        if (turn_right_1_valid && turn_right_2_valid) {
+            // both are turn rights
+            throw mapobjects::WaypointException::MULTIPLE_TURN_RIGHT_DETECTED;
+        } else if (turn_right_1_valid) {
+            // lane 1 is TURN_RIGHT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[0]);
+            std::cout << "generated inner waypoints" << std::endl;
+            waypoint.lp = lp_out_1;
+            waypoint.type = determineLanePointType(lp_out_1, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_1.p),
+                getLanePointDirection(lp_out_1));
+            waypoints.push_back(waypoint);
+        } else if (turn_right_2_valid) {
+            // lane 2 is TURN_RIGHT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[1]);
+            waypoint.lp = lp_out_2;
+            waypoint.type = determineLanePointType(lp_out_2, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_2.p),
+                getLanePointDirection(lp_out_2));
+            waypoints.push_back(waypoint);
+        } else {
+            throw mapobjects::WaypointException::NO_TURN_RIGHT_DETECTED;
+        }
+
+
+    // full junction with four roads
+    } else if (n_connections_out == 3) {
+        if (junction_debug) std::cout << "MapWaypoint: 2 outgoing connections" << std::endl;
+        // incoming road
+        double heading_junction_in = getLanePointDirection(lp);
+        if (geometry_debug) drawLanePoint(lp, 2, true);
+
+        // outgoing lane 1
+        mapobjects::LanePoint3D lp_out_1 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[0]));
+        double heading_out_1 = getLanePointDirection(lp_out_1);
+        bool turn_right_1_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_1, 2, true);
+
+        // outgoing lane 2
+        mapobjects::LanePoint3D lp_out_2 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[1]));
+        double heading_out_2 = getLanePointDirection(lp_out_2);
+        bool turn_right_2_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_2, 2, true);
+
+        // outgoing lane 3
+        mapobjects::LanePoint3D lp_out_3 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[2]));
+        double heading_out_3 = getLanePointDirection(lp_out_3);
+        bool turn_right_3_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_3, 2, true);
+
+        // compare the headings
+        double heading_to_out_1 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_1);
+        double heading_to_out_2 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_2);
+        double heading_to_out_3 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_3);
+
+        if ((heading_to_out_1 > (JUNCTION_RIGHT_ANGLE - JUNCTION_RIGHT_MARGIN)) &&
+            (heading_to_out_1 < (JUNCTION_RIGHT_ANGLE + JUNCTION_RIGHT_MARGIN))) {
+            // turn right is valid for outgoing lane 1
+            turn_right_1_valid = true;
+        }
+        if ((heading_to_out_2 > (JUNCTION_RIGHT_ANGLE - JUNCTION_RIGHT_MARGIN)) &&
+            (heading_to_out_2 < (JUNCTION_RIGHT_ANGLE + JUNCTION_RIGHT_MARGIN))) {
+            // turn right is valid for outgoing lane 2
+            turn_right_2_valid = true;
+        }
+        if ((heading_to_out_3 > (JUNCTION_RIGHT_ANGLE - JUNCTION_RIGHT_MARGIN)) &&
+            (heading_to_out_3 < (JUNCTION_RIGHT_ANGLE + JUNCTION_RIGHT_MARGIN))) {
+            // turn right is valid for outgoing lane 3
+            turn_right_3_valid = true;
+        }
+
+        if (junction_debug) {
+            std::cout << "MapWaypoint: lp headings:\t1: " \
+                << heading_junction_in << "\t2: " << heading_out_1 << "\t3: " \
+                << heading_out_2 << "\t4: " \
+                << heading_out_3 << std::endl;
+            std::cout << "MapWaypoint: headings:\t1: " \
+                << heading_to_out_1 << "\t2: " << heading_to_out_2 << "\t3: " \
+                << heading_to_out_3 << std::endl;
+            std::cout << "MapWaypoint: valid?:\t1: " \
+                << turn_right_1_valid << "\t2: " << turn_right_2_valid << "\t3: " \
+                << turn_right_3_valid << std::endl;
+        }
+
+        // create the waypoint or throw error
+        if ((turn_right_1_valid && turn_right_2_valid) ||
+            (turn_right_1_valid && turn_right_3_valid) ||
+            (turn_right_2_valid && turn_right_3_valid)) {
+            // more than one turn right
+            throw mapobjects::WaypointException::MULTIPLE_TURN_RIGHT_DETECTED;
+        } else if (turn_right_1_valid) {
+            // lane 1 is TURN_RIGHT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[0]);
+            waypoint.lp = lp_out_1;
+            waypoint.type = determineLanePointType(lp_out_1, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_1.p),
+                getLanePointDirection(lp_out_1));
+            waypoints.push_back(waypoint);
+        } else if (turn_right_2_valid) {
+            // lane 2 is TURN_RIGHT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[1]);
+            waypoint.lp = lp_out_2;
+            waypoint.type = determineLanePointType(lp_out_2, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_2.p),
+                getLanePointDirection(lp_out_2));
+            waypoints.push_back(waypoint);
+        } else if (turn_right_3_valid) {
+            // lane 3 is TURN_RIGHT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[2]);
+            waypoint.lp = lp_out_3;
+            waypoint.type = determineLanePointType(lp_out_3, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_3.p),
+                getLanePointDirection(lp_out_3));
+            waypoints.push_back(waypoint);
+        } else {
+            if (junction_debug) std::cout << "MapWaypoint: no turn right detected" << std::endl;
+            throw mapobjects::WaypointException::NO_TURN_RIGHT_DETECTED;
+        }
+
+
+    // more than 3 outgoing connections
+    } else {
+        // throw not implemented error
+        if (junction_debug) std::cout \
+            << "MapWaypoint: more than 3 outgoing connections" << std::endl;
+        throw mapobjects::WaypointException::MORE_THAN_3_OUTGOING_CONNECTIONS;
+    }
+
+    // return the waypoints
+    return waypoints;
+}
+
+/* function to get the first point on the new lane after turning right.
+   Throws error if not possible.
+    ARGUMENTS:
+        lp - the lanepoint before the junction. Type has to be JUNCTION.
+*/
+mapobjects::GlobalWaypoint Map::getWaypointTurnRight(mapobjects::LanePoint3D lp) {
+    return getWaypointsTurnRight(lp).back();
+}
+
+/* function to get all the waypoints including the first point
+   on the new lane after driving straight.
+   Throws error if not possible.
+    ARGUMENTS:
+        lp - the lanepoint before the junction. Type has to be JUNCTION.
+*/
+std::vector<mapobjects::GlobalWaypoint> Map::getWaypointsDriveStraight(mapobjects::LanePoint3D lp) {
+    std::vector<mapobjects::GlobalWaypoint> waypoints = std::vector<mapobjects::GlobalWaypoint>();
+    mapobjects::GlobalWaypoint waypoint = mapobjects::GlobalWaypoint(lp);
+    if (junction_debug) std::cout \
+        << "*** MapWaypoint: searching waypoint: drive straight ***" << std::endl;
+
+    // get the outgoing lanes of the lane before the junction
+    std::vector<mapobjects::Uuid> lane_connections_out = \
+        getRealConnectionsOut(getLaneFromLaneUuid(lp.lane_uuid));
+    int n_connections_out = lane_connections_out.size();
+    if (junction_debug) std::cout << "MapWaypoint: outgoing connections: " \
+        << n_connections_out << std::endl;
+
+    // analyze junction
+
+    // check if lanepoint connects to junction
+    if (n_connections_out < 1) {
+        // deadend
+        if (junction_debug) std::cout << "MapWaypoint: no outgoing connections" << std::endl;
+        throw mapobjects::WaypointException::NO_OUTGOING_CONNECTIONS;
+
+
+    // not a real junction. return first point on the next road
+    } else if (n_connections_out == 1) {
+        if (junction_debug) std::cout << "MapWaypoint: one outgoing connection" << std::endl;
+        mapobjects::LanePoint3D lp_out = getFirstLanePoint(getNextLaneUuid(lp.lane_uuid));
+        waypoint.lp = lp_out;
+        waypoint.type = determineLanePointType(lp_out, false).type;
+        waypoint.pose = mapobjects::Pose(
+            getRelativePoint3D(lp_out.p),
+            getLanePointDirection(lp_out));
+        waypoints.push_back(waypoint);
+
+
+    // T-junction of some sort. check if "drive straight" makes sense or throw error
+    } else if (n_connections_out == 2) {
+        if (junction_debug) std::cout << "MapWaypoint: 2 outgoing connections" << std::endl;
+        // incoming road
+        double heading_junction_in = getLanePointDirection(lp);
+        if (geometry_debug) drawLanePoint(lp, 2, true);
+
+        // outgoing lane 1
+        // go one lane further to get the lane after the connecting lane
+        mapobjects::LanePoint3D lp_out_1 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[0]));
+        double heading_out_1 = getLanePointDirection(lp_out_1);
+        bool drive_straight_1_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_1, 2, true);
+
+        // outgoing lane 2
+        mapobjects::LanePoint3D lp_out_2 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[1]));
+        double heading_out_2 = getLanePointDirection(lp_out_2);
+        bool drive_straight_2_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_2, 2, true);
+
+        // compare the headings
+        double heading_to_out_1 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_1);
+        double heading_to_out_2 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_2);
+
+        if ((heading_to_out_1 > (JUNCTION_STRAIGHT_ANGLE - JUNCTION_STRAIGHT_MARGIN)) &&
+            (heading_to_out_1 < (JUNCTION_STRAIGHT_ANGLE + JUNCTION_STRAIGHT_MARGIN))) {
+            // drive straight is valid for outgoing lane 1
+            drive_straight_1_valid = true;
+        }
+        if ((heading_to_out_2 > (JUNCTION_STRAIGHT_ANGLE - JUNCTION_STRAIGHT_MARGIN)) &&
+            (heading_to_out_2 < (JUNCTION_STRAIGHT_ANGLE + JUNCTION_STRAIGHT_MARGIN))) {
+            // drive straight is valid for outgoing lane 2
+            drive_straight_2_valid = true;
+        }
+
+        if (junction_debug) {
+            std::cout << "MapWaypoint: lp headings:\t1: " \
+                << heading_junction_in << "\t2: " << heading_out_1 << "\t3: " \
+                << heading_out_2 << std::endl;
+            std::cout << "MapWaypoint: headings:\t1: " \
+                << heading_to_out_1 << "\t2: " << heading_to_out_2 << std::endl;
+            std::cout << "MapWaypoint: valid?:\t1: " \
+                << drive_straight_1_valid << "\t2: " << drive_straight_2_valid << std::endl;
+        }
+
+        // create the waypoint or throw error
+        if (drive_straight_1_valid && drive_straight_2_valid) {
+            // both are drive straights
+            throw mapobjects::WaypointException::MULTIPLE_DRIVE_STRAIGHT_DETECTED;
+        } else if (drive_straight_1_valid) {
+            // lane 1 is TURN_RIGHT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[0]);
+            waypoint.lp = lp_out_1;
+            waypoint.type = determineLanePointType(lp_out_1, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_1.p),
+                getLanePointDirection(lp_out_1));
+            waypoints.push_back(waypoint);
+        } else if (drive_straight_2_valid) {
+            // lane 2 is TURN_RIGHT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[1]);
+            waypoint.lp = lp_out_2;
+            waypoint.type = determineLanePointType(lp_out_2, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_2.p),
+                getLanePointDirection(lp_out_2));
+            waypoints.push_back(waypoint);
+        } else {
+            throw mapobjects::WaypointException::NO_DRIVE_STRAIGHT_DETECTED;
+        }
+
+
+    // full junction with four roads
+    } else if (n_connections_out == 3) {
+        if (junction_debug) std::cout << "MapWaypoint: 3 outgoing connections" << std::endl;
+        // incoming road
+        double heading_junction_in = getLanePointDirection(lp);
+        if (geometry_debug) drawLanePoint(lp, 2, true);
+
+        // outgoing lane 1
+        // go one lane further to get the lane after the connecting lane
+        mapobjects::LanePoint3D lp_out_1 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[0]));
+        double heading_out_1 = getLanePointDirection(lp_out_1);
+        bool drive_straight_1_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_1, 2, true);
+
+        // outgoing lane 2
+        mapobjects::LanePoint3D lp_out_2 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[1]));
+        double heading_out_2 = getLanePointDirection(lp_out_2);
+        bool drive_straight_2_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_2, 2, true);
+
+        // outgoing lane 3
+        mapobjects::LanePoint3D lp_out_3 = getFirstLanePoint(
+            getNextLaneUuid(lane_connections_out[2]));
+        double heading_out_3 = getLanePointDirection(lp_out_3);
+        bool drive_straight_3_valid = false;
+        if (geometry_debug) drawLanePoint(lp_out_3, 2, true);
+
+        // compare the headings
+        double heading_to_out_1 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_1);
+        double heading_to_out_2 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_2);
+        double heading_to_out_3 = getDirectionalAngularDifference(
+            heading_junction_in, heading_out_3);
+
+        if ((heading_to_out_1 > (JUNCTION_STRAIGHT_ANGLE - JUNCTION_STRAIGHT_MARGIN)) &&
+            (heading_to_out_1 < (JUNCTION_STRAIGHT_ANGLE + JUNCTION_STRAIGHT_MARGIN))) {
+            // drive straight is valid for outgoing lane 1
+            drive_straight_1_valid = true;
+        }
+        if ((heading_to_out_2 > (JUNCTION_STRAIGHT_ANGLE - JUNCTION_STRAIGHT_MARGIN)) &&
+            (heading_to_out_2 < (JUNCTION_STRAIGHT_ANGLE + JUNCTION_STRAIGHT_MARGIN))) {
+            // drive straight is valid for outgoing lane 2
+            drive_straight_2_valid = true;
+        }
+        if ((heading_to_out_3 > (JUNCTION_STRAIGHT_ANGLE - JUNCTION_STRAIGHT_MARGIN)) &&
+            (heading_to_out_3 < (JUNCTION_STRAIGHT_ANGLE + JUNCTION_STRAIGHT_MARGIN))) {
+            // drive straight is valid for outgoing lane 3
+            drive_straight_3_valid = true;
+        }
+
+        if (junction_debug) {
+            std::cout << "MapWaypoint: lp headings:\t1: " \
+                << heading_junction_in << "\t2: " << heading_out_1 << "\t3: " \
+                << heading_out_2 << "\t4: " \
+                << heading_out_3 << std::endl;
+            std::cout << "MapWaypoint: headings:\t1: " \
+                << heading_to_out_1 << "\t2: " << heading_to_out_2 << "\t3: " \
+                << heading_to_out_3 << std::endl;
+            std::cout << "MapWaypoint: valid?:\t1: " \
+                << drive_straight_1_valid << "\t2: " << drive_straight_2_valid << "\t3: " \
+                << drive_straight_3_valid << std::endl;
+        }
+
+        // create the waypoint or throw error
+        if ((drive_straight_1_valid && drive_straight_2_valid) ||
+            (drive_straight_1_valid && drive_straight_3_valid) ||
+            (drive_straight_2_valid && drive_straight_3_valid)) {
+            // more than one drive straight
+            throw mapobjects::WaypointException::MULTIPLE_DRIVE_STRAIGHT_DETECTED;
+        } else if (drive_straight_1_valid) {
+            // lane 1 is TURN_RIGHT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[0]);
+            waypoint.lp = lp_out_1;
+            waypoint.type = determineLanePointType(lp_out_1, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_1.p),
+                getLanePointDirection(lp_out_1));
+            waypoints.push_back(waypoint);
+        } else if (drive_straight_2_valid) {
+            // lane 2 is TURN_RIGHT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[1]);
+            waypoint.lp = lp_out_2;
+            waypoint.type = determineLanePointType(lp_out_2, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_2.p),
+                getLanePointDirection(lp_out_2));
+            waypoints.push_back(waypoint);
+        } else if (drive_straight_3_valid) {
+            // lane 3 is TURN_RIGHT
+            waypoints = getInnerJunctionWaypoints(lane_connections_out[2]);
+            waypoint.lp = lp_out_3;
+            waypoint.type = determineLanePointType(lp_out_3, false).type;
+            waypoint.pose = mapobjects::Pose(
+                getRelativePoint3D(lp_out_3.p),
+                getLanePointDirection(lp_out_3));
+            waypoints.push_back(waypoint);
+        } else {
+            if (junction_debug) std::cout << "MapWaypoint: no drive straight detected" << std::endl;
+            throw mapobjects::WaypointException::NO_DRIVE_STRAIGHT_DETECTED;
+        }
+
+
+    // more than 3 outgoing connections
+    } else {
+        // throw not implemented error
+        if (junction_debug) std::cout \
+            << "MapWaypoint: more than 3 outgoing connections" << std::endl;
+        throw mapobjects::WaypointException::MORE_THAN_3_OUTGOING_CONNECTIONS;
+    }
+
+    // return the waypoints
+    return waypoints;
+}
+
+/* function to get the first point on the new lane after driving straight.
+   Throws error if not possible.
+    ARGUMENTS:
+        lp - the lanepoint before the junction. Type has to be JUNCTION.
+*/
+mapobjects::GlobalWaypoint Map::getWaypointDriveStraight(mapobjects::LanePoint3D lp) {
+    return getWaypointsDriveStraight(lp).back();
+}
+
+/* helper function to generate waypoints in the inner road of a junction */
+std::vector<mapobjects::GlobalWaypoint> Map::getInnerJunctionWaypoints(
+    mapobjects::Uuid junction_lane_uuid) {
+    std::vector<mapobjects::GlobalWaypoint> waypoints = std::vector<mapobjects::GlobalWaypoint>();
+    std::vector<mapobjects::Point3D> junction_points = getLanePoints(
+        junction_lane_uuid);
+    int n_points_junctionlane = junction_points.size();
+
+    // generate waypoints along the inner junction lane
+    for (int i = 0; i < n_points_junctionlane; i++) {
+        mapobjects::LanePoint3D lp = mapobjects::LanePoint3D(
+            junction_points[i], i, junction_lane_uuid);
+        mapobjects::GlobalWaypoint wp_i = mapobjects::GlobalWaypoint(
+            lp,
+            mapobjects::WaypointType::JUNCTION_ROAD);
+        wp_i.pose = mapobjects::Pose(
+            getRelativePoint3D(junction_points[i]),
+            getLanePointDirection(lp));
+        waypoints.push_back(wp_i);
+    }
+    return waypoints;
+}
+
+/* function to get the point on the lane after parking out to the left in a certain distance.
+   Throws error if not possible.
+    ARGUMENTS:
+        pose - the pose of the car. Must be at the height of a parking lot and in direction
+               of the road the parking lot is at.
+        park_out_left - if false, park out right
+        waypoint_distance - the distance to the left where the waypoint should be
+*/
+mapobjects::GlobalWaypoint Map::getWaypointParkOut(
+    const mapobjects::Pose& pose,
+    bool park_out_left,
+    double waypoint_distance) {
+    if (waypoint_debug) std::cout << "*** MapWaypoint: searching waypoint for park out ***" \
+        << std::endl;
+
+    // get all lanes with parking lots
+    std::vector<mapobjects::Uuid> parking_lane_uuids = std::vector<mapobjects::Uuid>();
+    for (std::unordered_map<std::string, std::vector<mapobjects::Uuid>>::const_iterator it = \
+        lane_parking_lookup.begin();
+        it != lane_parking_lookup.end(); it++) {
+        // get all lanes of the lanegroup in which one lane has parking
+        std::vector<mapobjects::Uuid> lg_lanes_parking_lane = getAllLanesFromLanegroup(
+            getLaneGroupUuidFromLaneUuid(lane_storage[lane_uuids.at(it->first)].getUuid()));
+        parking_lane_uuids.insert(
+            parking_lane_uuids.end(),
+            lg_lanes_parking_lane.begin(),
+            lg_lanes_parking_lane.end());
+    }
+
+    int n_parking_lane_uuids = parking_lane_uuids.size();
+    if (n_parking_lane_uuids < 1) {
+        std::cout << "MapWaypoint: no parking lots in map" << std::endl;
+        throw mapobjects::WaypointException::NO_PARKING_LOTS;
+    }
+
+    // get the line segment in starting from the car to its heading
+    mapobjects::Point3D p_1 = mapobjects::Point3D(
+        getAbsoluteX(pose.getX()),
+        getAbsoluteY(pose.getY()),
+        pose.getZ());
+    double heading_car = normalizeToAtan2(pose.getT());
+    double line_segment_length = 300;  // in cm
+    mapobjects::Point3D p_2 = mapobjects::Point3D(
+        p_1.getX() \
+            + cos(heading_car) * line_segment_length,
+        p_1.getY() \
+            + sin(heading_car) * line_segment_length,
+        p_1.getZ());
+    if (geometry_debug) {
+        drawPoint3D(p_1, 4, 6);
+        drawPoint3D(p_2, 3, 4);
+        drawLine(p_1, p_2, 2);
+    }
+    std::vector<int> lane_index = std::vector<int>();
+    std::vector<int> lane_segment_start_p_index = std::vector<int>();
+    std::vector<mapobjects::Point3D> p_projected = std::vector<mapobjects::Point3D>();
+
+    // iterate over all lanes with parking lots
+    for (int j = 0; j < n_parking_lane_uuids; j++) {
+        // intersect the line segment with each lane segment on the lane
+        //   get the lane points
+        std::vector<mapobjects::Point3D> points_lane = getLanePoints(parking_lane_uuids[j]);
+        int n_points_lane = points_lane.size();
+        for (int i = 0; i < (n_points_lane - 1); i++) {
+            mapobjects::Point3D p_l_1 = points_lane[i];
+            mapobjects::Point3D p_l_2 = points_lane[i+1];
+            // intersect the lane segments, abort if match found
+            // catch geometry errors
+            try {
+                p_projected.push_back(getLaneSegmentIntersection(p_1, p_2, p_l_1, p_l_2));
+                lane_segment_start_p_index.push_back(i);
+                lane_index.push_back(j);
+                if (geometry_debug) {
+                    drawPoint3D(p_l_1, 2, 5);
+                    drawPoint3D(p_l_2, 2, 5);
+                }
+            } catch (Map::GeometryException& e) {
+            }
+        }
+    }
+
+    // get the two closest distances
+    int n_matches = lane_index.size();
+    double distance_lowest = 1e9;
+    double distance_second_lowest = 1e9;
+    int lowest_index = 0;
+    int second_lowest_index = 0;
+    for (int i = 0; i < n_matches; i++) {
+        double distance = p_1.computeDistance(p_projected[i]);
+        if (distance < distance_lowest) {
+            distance_second_lowest = distance_lowest;
+            distance_lowest = distance;
+            second_lowest_index = lowest_index;
+            lowest_index = i;
+        } else {
+            if (distance < distance_second_lowest) {
+                distance_second_lowest = distance;
+                second_lowest_index = i;
+            }
+        }
+    }
+
+    // generate interpolated lanepoint at position of closest/second closest match
+    mapobjects::LanePoint3D lp_park_out = mapobjects::LanePoint3D();
+    if (n_matches < 1) {
+        std::cout << "MapWaypoint: could not localize at parking lot" << std::endl;
+        throw mapobjects::WaypointException::NOT_AT_PARKING;
+    } else if (n_matches == 1) {
+        // park out
+        std::cout << "MapWaypoint: WARNING: found only one lane to park out" << std::endl;
+        lp_park_out.p = p_projected[lowest_index];
+        lp_park_out.p_index = lane_segment_start_p_index[lowest_index];
+        lp_park_out.isInterpolated = true;
+        lp_park_out.lane_uuid = parking_lane_uuids[lane_index[lowest_index]];
+        lp_park_out.lane_info = getLaneInfo(lp_park_out.lane_uuid);
+        bool is_endpoint = false;
+        if (lp_park_out.p_index == static_cast<int>((getLanePoints(
+            parking_lane_uuids[
+                lane_index[
+                    lowest_index]]).size() - 1))) {
+            is_endpoint = true;
+        }
+        lp_park_out.lp_type = determineLanePointType(lp_park_out, is_endpoint);
+    } else if (n_matches > 1) {
+        // second closest is for parking out left
+        if (park_out_left) {
+            lp_park_out.p = p_projected[second_lowest_index];
+            lp_park_out.p_index = lane_segment_start_p_index[second_lowest_index];
+            lp_park_out.isInterpolated = true;
+            lp_park_out.lane_uuid = parking_lane_uuids[lane_index[second_lowest_index]];
+            lp_park_out.lane_info = getLaneInfo(lp_park_out.lane_uuid);
+            bool is_endpoint = false;
+            if (lp_park_out.p_index == static_cast<int>((getLanePoints(
+                parking_lane_uuids[
+                    lane_index[
+                        second_lowest_index]]).size() - 1))) {
+                is_endpoint = true;
+            }
+            lp_park_out.lp_type = determineLanePointType(lp_park_out, is_endpoint);
+        } else {
+            // park out right
+            lp_park_out.p = p_projected[lowest_index];
+            lp_park_out.p_index = lane_segment_start_p_index[lowest_index];
+            lp_park_out.isInterpolated = true;
+            lp_park_out.lane_uuid = parking_lane_uuids[lane_index[lowest_index]];
+            lp_park_out.lane_info = getLaneInfo(lp_park_out.lane_uuid);
+            bool is_endpoint = false;
+            if (lp_park_out.p_index == static_cast<int>((getLanePoints(
+                parking_lane_uuids[
+                    lane_index[
+                        lowest_index]]).size() - 1))) {
+                is_endpoint = true;
+            }
+            lp_park_out.lp_type = determineLanePointType(lp_park_out, is_endpoint);
+        }
+    }
+
+    // generate a waypoint in the requested distance
+    return getNextGlobalWaypoint(lp_park_out, waypoint_distance, false, false, true);
+}
+
+// ____________________________________________________________________________
+/* map route planning */
+
+/* function for planning a global route between start and end lanepoint */
+std::vector<mapobjects::Uuid> Map::planRoute(
+    const mapobjects::LanePoint3D& lp_start,
+    const mapobjects::LanePoint3D& lp_goal,
+    double* _route_costs) {
+    if (planning_debug) std::cout << "*** MapPlanner: searching route from start to goal lps ***"
+        << std::endl;
+
+    // start the route search
+    std::vector<mapobjects::Uuid> route_uuids = std::vector<mapobjects::Uuid>();
+    std::vector<mapobjects::GlobalWaypoint> route_waypoints = \
+        std::vector<mapobjects::GlobalWaypoint>();
+
+    *_route_costs = 0;
+
+    // start and goal on the same lane
+    if (lp_start.lane_uuid.equals(lp_goal.lane_uuid)) {
+        if (plan_generation_debug) std::cout
+            << "MapPlanner: start and goal lie on the same lane" << std::endl;
+
+        // start before goal
+        if (lp_start.p_index < lp_goal.p_index) {
+            route_uuids = findRoute(lp_start, lp_goal, _route_costs);
+
+        // start at goal
+        } else if (lp_start.p_index == lp_goal.p_index) {
+            std::cout << lp_start.p.getX() << "  " << lp_start.p.getY() << "  " << lp_goal.p.getX() << "  " << lp_goal.p.getY() << std::endl;
+            // normal search as lp_start/lp_goal are not interpolated
+            if (lp_start.isInterpolated || lp_goal.isInterpolated) {
+                std::cout <<
+                    "MapPlanner: ERROR: planRoute(): lp_start/lp_goal is interpolated. "
+                    << "not implemented." << std::endl;
+                throw mapobjects::PlannerException::NOT_IMPLEMENTED;
+            }
+            route_uuids = findRoute(lp_start, lp_goal, _route_costs);
+
+        // start after goal
+        } else {
+            // start search from next lane
+            std::vector<mapobjects::Uuid> successor_lane_uuids = getNextLaneUuids(
+                lp_start.lane_uuid);
+            int n_successor_lanes = successor_lane_uuids.size();
+            if (n_successor_lanes < 1) {
+                std::cout <<
+                    "MapPlanner: ERROR: lp_start is after lp_goal on the same lane,"
+                    << "but lane is deadend" << std::endl;
+                throw mapobjects::PlannerException::START_LANE_IS_DEADEND;
+            }
+
+            // plan all possibilities if multiple exist
+            std::vector<std::vector<mapobjects::Uuid>> routes_uuids =
+                std::vector<std::vector<mapobjects::Uuid>>(n_successor_lanes);
+            std::vector<double> routes_cost = std::vector<double>(n_successor_lanes);
+            double costs_min = 1e9;
+            int n_costs_min = 0;
+
+            for (int i = 0; i < n_successor_lanes; i++) {
+                routes_uuids[i] = findRoute(
+                    getFirstLanePoint(successor_lane_uuids[i]), lp_goal, &routes_cost[i]);
+                if (routes_cost[i] < costs_min) {
+                    costs_min = routes_cost[i];
+                    n_costs_min = i;
+                }
+                if (planning_debug) {
+                    std::cout << "MapPlanner: checking route variant: " << i << std::endl;
+                    std::cout << "MapPlanner: > costs: " << routes_cost[i] << std::endl;
+                }
+            }
+            if (planning_debug) {
+                std::cout << "MapPlanner: taking shortest variant: " << n_costs_min << std::endl;
+            }
+            route_uuids = routes_uuids[n_costs_min];
+            *_route_costs = costs_min;
+            // handle remainder of first lane
+            route_uuids.insert(route_uuids.begin(), lp_start.lane_uuid);
+        }
+
+    // start and goal on different lanes
+    } else {
+        route_uuids = findRoute(lp_start, lp_goal, _route_costs);
+    }
+
+    if (planning_debug) {
+        int n_lanes_route = route_uuids.size();
+        std::cout << "MapPlanner: found route size: " << n_lanes_route << std::endl;
+        std::cout << "MapPlanner: found route cost: " << *_route_costs << std::endl;
+        if (plan_generation_debug) {
+            for (int i = 0; i < n_lanes_route; i++) {
+                std::cout << " > lane uuid: " << route_uuids[i].getUuidValue() << std::endl;
+            }
+        }
+    }
+
+    return route_uuids;
+}
+
+/* function for planning a global route between start and end poses.
+   Returns a list of waypoints fromn start to goal.
+*/
+std::vector<mapobjects::GlobalWaypoint> Map::planWaypointRoute(
+    const mapobjects::Pose& pose_start,
+    const mapobjects::Pose& pose_goal,
+    double waypoint_distance,
+    bool ignoreStoplines,
+    bool ignoreCrosswalks) {
+    if (planning_debug) std::cout <<
+        "*** MapPlanner: searching waypoint route from start to goal pose ***"
+        << std::endl;
+
+    mapobjects::LanePoint3D lp_start = getSearchStartLanePoint3D(pose_start);
+    mapobjects::LanePoint3D lp_goal = getSearchStartLanePoint3D(pose_goal);
+
+    // start the route search
+    std::vector<mapobjects::Uuid> route_uuids = std::vector<mapobjects::Uuid>();
+    std::vector<mapobjects::GlobalWaypoint> route_waypoints = \
+        std::vector<mapobjects::GlobalWaypoint>();
+
+    double route_costs = 0;
+    route_uuids = planRoute(
+        lp_start,
+        lp_goal,
+        &route_costs);
+
+    // generate maneuver list here if needed
+    route_waypoints = getRouteWaypoints(
+        route_uuids, lp_start, lp_goal, waypoint_distance, ignoreStoplines, ignoreCrosswalks);
+
+    return route_waypoints;
+}
+
+/* function for planning a global route between start and end poses.
+   Returns a list of driving maneuvers to reach the goal.
+*/
+mapobjects::ManeuverRoute Map::planManeuverRoute(
+    const mapobjects::Pose& pose_start,
+    const mapobjects::Pose& pose_goal) {
+    if (planning_debug) std::cout <<
+        "*** MapPlanner: searching maneuver route from start to goal pose ***" << std::endl;
+
+    // start the route search
+    std::vector<mapobjects::Uuid> route_uuids = std::vector<mapobjects::Uuid>();
+    std::vector<mapobjects::GlobalWaypoint> route_waypoints = \
+        std::vector<mapobjects::GlobalWaypoint>();
+
+    mapobjects::LanePoint3D lp_start = getSearchStartLanePoint3D(pose_start);
+    mapobjects::LanePoint3D lp_goal = getSearchStartLanePoint3D(pose_goal);
+
+    double route_costs = 0;
+    route_uuids = planRoute(
+        lp_start,
+        lp_goal,
+        &route_costs);
+
+    // generate maneuver list
+    std::vector<mapobjects::AADC_Maneuver> maneuvers_route = getRouteManeuvers(route_uuids);
+    mapobjects::GlobalWaypoint wp_start = mapobjects::GlobalWaypoint(
+        lp_start,
+        mapobjects::WaypointType::PLAN_START,
+        mapobjects::Pose(
+            getRelativePoint3D(lp_start.p),
+            getLanePointDirection(lp_start)));
+    mapobjects::GlobalWaypoint wp_goal = mapobjects::GlobalWaypoint(
+        lp_goal,
+        mapobjects::WaypointType::PLAN_GOAL,
+        mapobjects::Pose(
+            getRelativePoint3D(lp_goal.p),
+            getLanePointDirection(lp_goal)));
+    mapobjects::ManeuverRoute route_maneuvers = mapobjects::ManeuverRoute(
+        wp_start, wp_goal, maneuvers_route);
+
+    return route_maneuvers;
+}
+
+double Map::getRouteCosts(const mapobjects::Pose& pose_start, const mapobjects::Pose& pose_goal) {
+    // start the route search
+    std::vector<mapobjects::Uuid> route_uuids = std::vector<mapobjects::Uuid>();
+
+    mapobjects::LanePoint3D lp_start = getSearchStartLanePoint3D(pose_start);
+    mapobjects::LanePoint3D lp_goal = getSearchStartLanePoint3D(pose_goal);
+
+    double route_costs = 0;
+    route_uuids = planRoute(
+        lp_start,
+        lp_goal,
+        &route_costs);
+    return route_costs;
+}
+
+/* function to get the LanePoint3D to start the global path search from */
+mapobjects::LanePoint3D Map::getSearchStartLanePoint3D(const mapobjects::Pose& pose_start) {
+    // get the initial lanepoint
+    mapobjects::Pose pose_start_abs = mapobjects::Pose(
+        getAbsoluteX(pose_start.getX()),
+        getAbsoluteY(pose_start.getY()),
+        pose_start.getZ(),
+        pose_start.getT());
+    mapobjects::LanePoint3D lp_start = getNearestLanePoint(pose_start_abs);
+    if (planning_debug) drawLanePoint(lp_start, 4, false, true);
+    return lp_start;
+}
+
+/* function to get the LanePoint3D to start the global path search from */
+mapobjects::LanePoint3D Map::getSearchGoalLanePoint3D(const mapobjects::Pose& pose_goal) {
+    // get the goal lanepoint
+    mapobjects::Pose pose_goal_abs = mapobjects::Pose(
+        getAbsoluteX(pose_goal.getX()),
+        getAbsoluteY(pose_goal.getY()),
+        pose_goal.getZ(),
+        pose_goal.getT());
+    mapobjects::LanePoint3D lp_goal = getNearestLanePoint(pose_goal_abs);
+    if (planning_debug) drawLanePoint(lp_goal, 4, false, true);
+    return lp_goal;
+}
+
+/* function to find a route between two lanepoints given the map graph. Implements A* */
+std::vector<mapobjects::Uuid> Map::findRoute(
+    const mapobjects::LanePoint3D& lp_start,
+    const mapobjects::LanePoint3D& lp_goal,
+    double* _costs) {
+
+    *_costs = 1e9;
+    if (planner_debug) {
+        std::cout << "MapAStar: starting search" << std::endl;
+    }
+
+    // initialize the lists
+    map_priority_queue<
+        mapobjects::LaneNode,
+        std::vector<mapobjects::LaneNode>,
+        std::greater<std::vector<mapobjects::LaneNode>::value_type>> open_nodes;
+
+    std::vector<mapobjects::LaneNode> processed_nodes = std::vector<mapobjects::LaneNode>();
+
+    std::vector<mapobjects::Uuid> path_uuids = std::vector<mapobjects::Uuid>();
+
+    // define the goal
+    mapobjects::Uuid goal_uuid = lp_goal.lane_uuid;
+
+    // add the start node to open_nodes
+    mapobjects::LaneNode start_node = mapobjects::LaneNode(
+        lp_start.lane_uuid, mapobjects::Uuid("startnode"), 0, 0,
+        getRealConnectionsOut(getLaneFromLaneUuid(lp_start.lane_uuid)));
+    open_nodes.push(start_node);
+    if (planner_debug) std::cout << "MapAStar: > pushing start node" << std::endl;
+
+    // while there are unexpanded nodes
+    while (open_nodes.size() > 0) {
+        // expand the current node
+        mapobjects::LaneNode current_node = open_nodes.top();
+        open_nodes.pop();
+        processed_nodes.push_back(current_node);
+        if (planner_debug) std::cout << "MapAStar: > expanding top node" << std::endl;
+
+        // goal reached
+        if (goalReached(current_node, goal_uuid)) {
+            if (planner_debug) std::cout << "MapAStar: goal reached! backtracking" << std::endl;
+            *_costs = current_node.g;
+            // backtrack
+            while (current_node.parent_uuid.getUuidValue() != "startnode") {
+                path_uuids.push_back(current_node.lane_uuid);
+                if (planner_debug) std::cout <<
+                    "MapAStar: > backtracking: adding parent node to path" << std::endl;
+                current_node = getNodeFromUuid(current_node.parent_uuid, processed_nodes);
+            }
+            // add the start node for completeness
+            if (planner_debug) std::cout <<
+                "MapAStar: > backtracking: adding start node to path" << std::endl;
+            path_uuids.push_back(start_node.lane_uuid);
+            std::reverse(path_uuids.begin(), path_uuids.end());
+            break;
+        }
+
+        // process all successor nodes
+        for (const mapobjects::Uuid& successor_uuid : current_node.successors()) {
+            if (planner_debug) std::cout << "MapAStar:  > processing successor node" << std::endl;
+            bool successor_processed = false;
+            int n_processed_nodes = processed_nodes.size();
+            for (int i = 0; i < n_processed_nodes; i++) {
+                if (processed_nodes[i].lane_uuid == successor_uuid) {
+                    // node already processed
+                    successor_processed = true;
+                    break;
+                }
+            }
+            if (successor_processed) {
+                if (planner_debug) std::cout <<
+                    "MapAStar:   > successor node already processed. continuing." << std::endl;
+                continue;
+            }
+
+            // create the successor node
+            double g = current_node.g + \
+                getLanePoints(current_node.lane_uuid).back().computeDistance(
+                    getLanePoints(successor_uuid).back());
+            const mapobjects::LaneNode successor_node = mapobjects::LaneNode(
+                successor_uuid, current_node.lane_uuid, g, h_function(successor_uuid, lp_goal),
+                getRealConnectionsOut(getLaneFromLaneUuid(successor_uuid)));
+
+            // check if successor_node in open_nodes
+            std::vector<mapobjects::LaneNode>::const_iterator it = open_nodes.find(successor_node);
+            if (it != open_nodes.end()) {
+                // if in open_nodes
+                if (successor_node.g > it->g) {
+                    // don't add the successor node if more expensive
+                    continue;
+                }
+            }
+
+            // add the successor node
+            open_nodes.push(successor_node);
+            if (planner_debug) std::cout <<
+                "MapAStar:   > adding successor node to open list" << std::endl;
+        }
+    }
+
+    if (path_uuids.size() < 1) {
+        std::cout << "MapAStar: ERROR: could not find a path to the goal" << std::endl;
+        throw mapobjects::PlannerException::NO_GOAL_FOUND;
+    }
+
+    // generate the waypoints along the route
+    return path_uuids;
+}
+
+/* function to extract the relevant waypoints from a planned route */
+std::vector<mapobjects::GlobalWaypoint> Map::getRouteWaypoints(
+    const std::vector<mapobjects::Uuid>& route_uuids,
+    mapobjects::LanePoint3D lp_start,
+    mapobjects::LanePoint3D lp_goal,
+    double waypoint_distance,
+    bool ignoreStoplines,
+    bool ignoreCrosswalks) {
+    std::vector<mapobjects::GlobalWaypoint> waypoints = std::vector<mapobjects::GlobalWaypoint>();
+
+    int n_lanes_route = route_uuids.size();
+    // int n_waypoints = 0;
+    if (planning_debug) {
+        std::cout << "MapPlanner: generating waypoints from path"
+            << std::endl;
+        std::cout << "MapPlanner: n lanes on path: " << n_lanes_route
+            << std::endl;
+    }
+
+    // keep track of all visited lanes
+    std::vector<mapobjects::Uuid> processed_lanes = std::vector<mapobjects::Uuid>();
+    processed_lanes.push_back(lp_start.lane_uuid);
+
+    // path has length > 1
+    if (n_lanes_route > 1) {
+        waypoints.push_back(
+            mapobjects::GlobalWaypoint(
+                lp_start,
+                mapobjects::WaypointType::PLAN_START,
+                mapobjects::Pose(
+                    getRelativePoint3D(lp_start.p),
+                    getLanePointDirection(lp_start))));
+        mapobjects::LanePoint3D lp = lp_start;
+        mapobjects::LanePoint3D lp_prev = lp_start;
+
+        if (plan_generation_debug)
+            std::cout << "current lane id " << lp.lane_uuid.getUuidValue() << std::endl;
+
+        int i = 0;  // the lane index
+        double offset_goal = getOffsetAlongLane(lp_goal);
+        double offset_current = 0;
+        bool goal_reached = false;
+
+        while (i < n_lanes_route) {
+            // generate waypoints until the next junction
+            while (lp.lp_type.type != mapobjects::WaypointType::JUNCTION) {
+
+                // get the next waypoint in the desired distance
+                mapobjects::GlobalWaypoint wp_next = getNextGlobalWaypoint(
+                    lp, waypoint_distance, ignoreStoplines, ignoreCrosswalks, true);
+                lp_prev = lp;
+                lp = wp_next.lp;
+                if (plan_generation_debug)
+                    std::cout << "current lane id " << lp.lane_uuid.getUuidValue() << std::endl;
+
+                // goal check
+                if (lp.lane_uuid.equals(lp_goal.lane_uuid) && i > 0) {
+                    if (plan_generation_debug) std::cout << "goal check" << std::endl;
+
+                    offset_current = getOffsetAlongLane(lp);
+                    if (offset_current < offset_goal) {
+                        if (plan_generation_debug)
+                            std::cout << "MapPlanner: offset not exceeded" << std::endl;
+
+                        waypoints.push_back(wp_next);
+                        continue;
+                    } else {
+                        if (plan_generation_debug)
+                            std::cout << "MapPlanner: offset exceeded. adding goal" << std::endl;
+
+                        // add the final waypoint
+                        waypoints.push_back(mapobjects::GlobalWaypoint(
+                            lp_goal,
+                            mapobjects::WaypointType::PLAN_GOAL,
+                            mapobjects::Pose(
+                                getRelativePoint3D(lp_goal.p),
+                                getLanePointDirection(lp_goal))));
+                        i = (n_lanes_route - 1);
+                        goal_reached = true;
+                        break;
+                    }
+                }
+
+                // keep track of the current lane
+                if (!lp.lane_uuid.equals(route_uuids[i])) {
+                    if (plan_generation_debug)
+                        std::cout << "MapPlanner: lane uuid has changed" << std::endl;
+
+                    // check that i not out of bounds in inner loop
+                    if (i < (n_lanes_route - 1)) {
+                        // lane is successor lane
+                        if (lp.lane_uuid.equals(route_uuids[i + 1])) {
+                            // if lane is goal is checked before
+                            i++;
+                            processed_lanes.push_back(lp.lane_uuid);
+                            if (plan_generation_debug)
+                                std::cout << "MapPlanner: new lane is next lane" << std::endl;
+
+                        // lane is some other lane
+                        } else {
+                            if (plan_generation_debug)
+                                std::cout << "MapPlanner: new lane is other lane" << std::endl;
+
+                            // check if current lane_uuid is in the path at all
+                            std::vector<mapobjects::Uuid>::const_iterator it = std::find(
+                                route_uuids.begin(), route_uuids.end(), lp.lane_uuid);
+                            int i_new = it - route_uuids.begin();
+
+                            // lane in the path
+                            if (it != route_uuids.end()) {
+                                if (plan_generation_debug)
+                                    std::cout << "new lane is in lane path" << std::endl;
+
+                                // check if lane was processed before
+                                if (std::find(
+                                    processed_lanes.begin(), processed_lanes.end(), lp.lane_uuid)
+                                    == processed_lanes.end()) {
+                                    // lane was not processed before
+                                    waypoints.push_back(wp_next);
+                                    // update lane index
+                                    i = i_new;
+                                    processed_lanes.push_back(lp.lane_uuid);
+
+                                    if (plan_generation_debug) std::cout <<
+                                        "MapPlanner: lane uuid in route: " << i << std::endl;
+
+                                    continue;
+                                }  // else below
+                            }
+
+                            // lane not in the path
+                            if (plan_generation_debug)
+                                std::cout << "MapPlanner: uuid not in route or already processed. "
+                                << "returning goal point" << std::endl;
+
+                            processed_lanes.push_back(lp.lane_uuid);
+                            // return the goal point, assume goal already traversed
+                            waypoints.push_back(mapobjects::GlobalWaypoint(
+                                lp_goal,
+                                mapobjects::WaypointType::PLAN_GOAL,
+                                mapobjects::Pose(
+                                    getRelativePoint3D(lp_goal.p),
+                                    getLanePointDirection(lp_goal))));
+                            i = n_lanes_route;
+                            goal_reached = true;
+                            break;
+                        }
+
+                    // i out of bounds
+                    } else {
+                        if (plan_generation_debug)
+                            std::cout << "MapPlanner: goal lane exceeded. returning goal point"
+                            << std::endl;
+
+                        processed_lanes.push_back(lp.lane_uuid);
+                        // return the goal point, assume goal already traversed
+                        waypoints.push_back(mapobjects::GlobalWaypoint(
+                            lp_goal,
+                            mapobjects::WaypointType::PLAN_GOAL,
+                            mapobjects::Pose(
+                                getRelativePoint3D(lp_goal.p),
+                                getLanePointDirection(lp_goal))));
+                        i = n_lanes_route;
+                        goal_reached = true;
+                        break;
+                    }
+                }
+                waypoints.push_back(wp_next);
+            }
+            if ((!(i < (n_lanes_route - 1))) || goal_reached) {
+                if (plan_generation_debug)
+                    std::cout << "MapPlanner: outer goal check true" << std::endl;
+                // goal reached
+                break;
+            }
+            // proceed to the next lane -> junction
+            i++;
+            if (plan_generation_debug)
+                std::cout << "MapPlanner: adding junction lane waypoints" << std::endl;
+
+            // add junction lane and proceed to next lane after junction
+            std::vector<mapobjects::GlobalWaypoint> wps = getInnerJunctionWaypoints(route_uuids[i]);
+            waypoints.insert(waypoints.end(), wps.begin(), wps.end());
+            i++;
+            lp = getFirstLanePoint(route_uuids[i]);
+        }
+
+
+    // start lane is also end lane
+    } else {
+        if (!lp_start.lane_uuid.equals(lp_goal.lane_uuid)) {
+            std::cout <<
+                "MapPlanner: ERROR: route has length 1 && lp_start and lp_goal"
+                << " are on different lanes" << std::endl;
+            throw mapobjects::PlannerException::PATH_INCONSISTENT;
+        }
+        std::vector<mapobjects::GlobalWaypoint> wps = getLaneWaypoints(
+            route_uuids[0],
+            &lp_start, &lp_goal,
+            true, true,
+            waypoint_distance, ignoreStoplines, ignoreCrosswalks);
+        waypoints.insert(waypoints.end(), wps.begin(), wps.end());
+        return waypoints;
+    }
+
+    if (planning_debug) std::cout << "MapPlanner: returning from waypoint generation" << std::endl;
+    return waypoints;
+}
+
+/* function to get all waypoints on a specified lane given the parameters. */
+std::vector<mapobjects::GlobalWaypoint> Map::getLaneWaypoints(
+    mapobjects::Uuid lane_uuid,
+    mapobjects::LanePoint3D* lp_start,
+    mapobjects::LanePoint3D* lp_goal,
+    bool isStart,
+    bool isGoal,
+    double waypoint_distance,
+    bool ignoreStoplines,
+    bool ignoreCrosswalks) {
+    std::vector<mapobjects::GlobalWaypoint> waypoints = std::vector<mapobjects::GlobalWaypoint>();
+    std::cout << "    getting lane waypoints" << std::endl;
+    if (!isStart && !isGoal) {
+        // return all waypoints along the lane
+        if (!getLaneFromLaneUuid(lane_uuid).getVisibility()) {
+            // return all lanepoints as waypoints for junctions
+            std::vector<mapobjects::Point3D> lane_points = getLanePoints(lane_uuid);
+            return getInnerJunctionWaypoints(lane_uuid);
+        } else {
+            // normal road
+            mapobjects::LanePoint3D lp = mapobjects::LanePoint3D(
+                getLanePoints(lane_uuid)[0], 0, lane_uuid);
+            lp.lp_type = determineLanePointType(lp, false);
+            lp.lane_info = getLaneInfo(lane_uuid);
+            waypoints.push_back(mapobjects::GlobalWaypoint(
+                    lp,
+                    lp.lp_type.type,
+                    mapobjects::Pose(
+                        getRelativePoint3D(lp.p),
+                        getLanePointDirection(lp))));
+            while (lp.lp_type.type != mapobjects::WaypointType::JUNCTION) {
+                mapobjects::GlobalWaypoint wp_next = getNextGlobalWaypoint(
+                    lp, waypoint_distance, ignoreStoplines, ignoreCrosswalks, true);
+                waypoints.push_back(wp_next);
+                lp = wp_next.lp;
+            }
+            std::cout << "waypoints size: " << waypoints.size() << std::endl;
+            return waypoints;
+        }
+
+    } else if (isStart && !isGoal) {
+        // return all waypoints along the lane starting from the start
+        if (lp_start == nullptr) {
+            std::cout <<
+                "MapPlanner: ERROR: getLaneWaypoints() was called with nullptr and invalid flag"
+                << std::endl;
+            throw mapobjects::PlannerException::LP_IS_NULLPTR;
+        }
+        mapobjects::LanePoint3D lp = *lp_start;
+        waypoints.push_back(mapobjects::GlobalWaypoint(
+            lp,
+            mapobjects::WaypointType::PLAN_START,
+            mapobjects::Pose(
+                getRelativePoint3D(lp.p),
+                getLanePointDirection(lp))));
+        while (lp.lp_type.type != mapobjects::WaypointType::JUNCTION) {
+            mapobjects::GlobalWaypoint wp_next = getNextGlobalWaypoint(
+                lp, waypoint_distance, ignoreStoplines, ignoreCrosswalks, true);
+            waypoints.push_back(wp_next);
+            lp = wp_next.lp;
+        }
+        return waypoints;
+
+    } else if (!isStart && isGoal) {
+        // return all waypoints starting from the lane start to the goal
+        if (lp_goal == nullptr) {
+            std::cout <<
+                "MapPlanner: ERROR: getLaneWaypoints() was called with nullptr and invalid flag"
+                << std::endl;
+            throw mapobjects::PlannerException::LP_IS_NULLPTR;
+        }
+        double offset_goal = getOffsetAlongLane(*lp_goal);
+        mapobjects::LanePoint3D lp = mapobjects::LanePoint3D(
+            getLanePoints(lane_uuid)[0], 0, lane_uuid);
+        lp.lp_type = determineLanePointType(lp, false);
+        lp.lane_info = getLaneInfo(lane_uuid);
+        waypoints.push_back(
+            mapobjects::GlobalWaypoint(
+                lp, lp.lp_type.type, mapobjects::Pose(
+                    getRelativePoint3D(lp.p),
+                    getLanePointDirection(lp))));
+        while (getOffsetAlongLane(lp) < (offset_goal - waypoint_distance)) {
+            // insert intermediate waypoints
+            mapobjects::GlobalWaypoint wp_next = getNextGlobalWaypoint(
+                lp, waypoint_distance, ignoreStoplines, ignoreCrosswalks, true);
+            waypoints.push_back(wp_next);
+            lp = wp_next.lp;
+        }
+        waypoints.push_back(
+            mapobjects::GlobalWaypoint(
+                *lp_goal,
+                mapobjects::WaypointType::PLAN_GOAL,
+                mapobjects::Pose(
+                    getRelativePoint3D(lp_goal->p),
+                    getLanePointDirection(*lp_goal))));
+        return waypoints;
+
+    } else if (isStart && isGoal) {
+        // return all waypoints along the lane from start to goal. start has to be before goal
+        double offset_start = getOffsetAlongLane(*lp_start);
+        double offset_goal = getOffsetAlongLane(*lp_goal);
+        if (offset_goal < offset_start) {
+            std::cout <<
+                "MapPlanner: ERROR: getLaneWaypoints(): goal lp is before start lp"
+                << std::endl;
+            throw mapobjects::PlannerException::GOAL_LP_BEHIND_START_LP;
+        } else {
+            // return the waypoints along the lane between start and goal
+            mapobjects::LanePoint3D lp = *lp_start;
+            waypoints.push_back(
+                mapobjects::GlobalWaypoint(
+                    *lp_start,
+                    mapobjects::WaypointType::PLAN_START,
+                    mapobjects::Pose(
+                        getRelativePoint3D(lp_start->p),
+                        getLanePointDirection(*lp_start))));
+            while (lp.lp_type.type != mapobjects::WaypointType::JUNCTION) {
+                // insert intermediate waypoints
+                mapobjects::GlobalWaypoint wp_next = getNextGlobalWaypoint(
+                    lp, waypoint_distance, ignoreStoplines, ignoreCrosswalks, true);
+                if (getOffsetAlongLane(wp_next.lp) < offset_goal) {
+                    waypoints.push_back(wp_next);
+                    lp = wp_next.lp;
+                } else {
+                    // goal reached
+                    break;
+                }
+            }
+            waypoints.push_back(
+                mapobjects::GlobalWaypoint(
+                    *lp_goal,
+                    mapobjects::WaypointType::PLAN_GOAL,
+                    mapobjects::Pose(
+                        getRelativePoint3D(lp_goal->p),
+                        getLanePointDirection(*lp_goal))));
+            return waypoints;
+        }
+    }
+    return waypoints;
+}
+
+/* function to generate the AADC maneuvers from a global route */
+std::vector<mapobjects::AADC_Maneuver> Map::getRouteManeuvers(
+    const std::vector<mapobjects::Uuid>& route_uuids) {
+    std::vector<mapobjects::AADC_Maneuver> man_ids = std::vector<mapobjects::AADC_Maneuver>();
+    int n_lanes_route = route_uuids.size();
+    for (int i = 0; i < n_lanes_route; i++) {
+        if (i == 0) {
+            std::vector<mapobjects::Uuid> l_connections_in = getRealConnectionsIn(
+                getLaneFromLaneUuid(route_uuids[i]));
+            if (static_cast<int>(l_connections_in.size()) > 0) {
+                // if first lane is junction
+                if (getRealConnectionsOut(getLaneFromLaneUuid(l_connections_in[0])).size() > 1) {
+                    mapobjects::AADC_Maneuver man = getJunctionLaneTurnType((route_uuids[i]));
+                    man_ids.push_back(man);
+                }
+            }
+        }
+        if (checkSuccessorIsJunction(getLaneFromLaneUuid(route_uuids[i]))) {
+            // if successor is junction
+            try {
+                if ((i + 1) < n_lanes_route) {
+                    if (plan_generation_debug) std::cout << "successor is junction, id: "
+                        << route_uuids[i + 1].getUuidValue() << std::endl;
+                    mapobjects::AADC_Maneuver man = getJunctionLaneTurnType((route_uuids[i + 1]));
+                    man_ids.push_back(man);
+                }
+            } catch (mapobjects::WaypointException e) {
+                std::cout <<"MapPlanner: ERROR: getRouteManeuvers(): "
+                << "junction turn type could not be resolved" << std::endl;
+            }
+        }
+    }
+    return man_ids;
+}
+
+mapobjects::LaneNode Map::getNodeFromUuid(const mapobjects::Uuid& current_node_uuid,
+    const std::vector<mapobjects::LaneNode>& nodes) {
+    int n_nodes = nodes.size();
+
+    for (int i = 0; i < n_nodes; i++) {
+        if (nodes[i].lane_uuid.equals(current_node_uuid)) {
+            return nodes[i];
+        }
+    }
+    return mapobjects::LaneNode(
+        mapobjects::Uuid("error"), mapobjects::Uuid("not found"),
+        0, 0, std::vector<mapobjects::Uuid>());
+}
+/* function for A* goal check between two mapobject::LaneNodes */
+bool Map::goalReached(const mapobjects::LaneNode& node_1, const mapobjects::Uuid& goal_uuid) {
+    if (node_1.lane_uuid.equals(goal_uuid)) {
+        return true;
+    }
+    return false;
+}
+
+/* function to compute the heuristical estimate from the current node to the goal.
+   Uses euclidian distance between endpoint of current lane and the goal lanepoint.
+*/
+double Map::h_function(const mapobjects::Uuid& lane_uuid, const mapobjects::LanePoint3D& lp_goal) {
+    return getLanePoints(lane_uuid).back().computeDistance(lp_goal.p);
+}
+
+/* function to get the AADC turn type out of a junction lane */
+mapobjects::AADC_Maneuver Map::getJunctionLaneTurnType(const mapobjects::Uuid& lane_uuid) {
+    mapobjects::LanePoint3D lp_in = mapobjects::LanePoint3D(
+        getLanePoints(lane_uuid)[0],
+        0,
+        lane_uuid,
+        mapobjects::WaypointType::JUNCTION_ROAD);
+    mapobjects::LanePoint3D lp_out = getFirstLanePoint(
+        getNextLaneUuid(lane_uuid));
+    double heading_junction_in = getLanePointDirection(lp_in);
+    double heading_junction_out = getLanePointDirection(lp_out);
+
+    double heading_in_to_out = getDirectionalAngularDifference(
+            heading_junction_in, heading_junction_out);
+
+    bool turn_left_valid = false;
+    bool turn_right_valid = false;
+    bool drive_straight_valid = false;
+
+    if (geometry_debug)
+        std::cout << "junction headings:\nin: "
+        << heading_junction_in << "\nout: " << heading_junction_out << std::endl;
+
+    if ((heading_in_to_out > (JUNCTION_LEFT_ANGLE - JUNCTION_LEFT_MARGIN)) &&
+        (heading_in_to_out < (JUNCTION_LEFT_ANGLE + JUNCTION_LEFT_MARGIN))) {
+        // turn left is valid for outgoing lane
+        turn_left_valid = true;
+    }
+    if ((heading_in_to_out > (JUNCTION_RIGHT_ANGLE - JUNCTION_RIGHT_MARGIN)) &&
+        (heading_in_to_out < (JUNCTION_RIGHT_ANGLE + JUNCTION_RIGHT_MARGIN))) {
+        // turn right is valid for outgoing lane
+        turn_right_valid = true;
+    }
+    if ((heading_in_to_out > (JUNCTION_STRAIGHT_ANGLE - JUNCTION_STRAIGHT_MARGIN)) &&
+        (heading_in_to_out < (JUNCTION_STRAIGHT_ANGLE + JUNCTION_STRAIGHT_MARGIN))) {
+        // drive straight is valid for outgoing lane 1
+        drive_straight_valid = true;
+    }
+
+    if (turn_left_valid) {
+        if (turn_right_valid || drive_straight_valid) {
+            throw mapobjects::WaypointException::MULTIPLE_TURN_TYPES_DETECTED;
+        } else {
+            return mapobjects::AADC_Maneuver(mapobjects::AADC_Maneuvers::TURN_LEFT);
+        }
+    }
+    if (turn_right_valid) {
+        if (turn_left_valid || drive_straight_valid) {
+            throw mapobjects::WaypointException::MULTIPLE_TURN_TYPES_DETECTED;
+        } else {
+            return mapobjects::AADC_Maneuver(mapobjects::AADC_Maneuvers::TURN_RIGHT);
+        }
+    }
+    if (drive_straight_valid) {
+        if (turn_left_valid || turn_right_valid) {
+            throw mapobjects::WaypointException::MULTIPLE_TURN_TYPES_DETECTED;
+        } else {
+            return mapobjects::AADC_Maneuver(mapobjects::AADC_Maneuvers::DRIVE_STRAIGHT);
+        }
+    }
+    return mapobjects::AADC_Maneuver(mapobjects::AADC_Maneuvers::NOT_SPECIFIED);
+}
+
+/* function to select the closest heading of the lane given the heading of the car.
+   Invariant to inverting. (Use for normal generation)
+*/
+double Map::getClosestLaneHeading(mapobjects::LanePoint3D lp, mapobjects::Pose pose) {
+    double heading_target = pose.getT();
+    std::vector<mapobjects::Point3D> lane_points = \
+        getLaneFromLaneUuid(lp.lane_uuid).getPoints();
+    double heading_to_predecessor = heading_target;
+    double heading_to_successor = heading_target;
+    int n_points = lane_points.size();
+    if (n_points > 1) {
+        if (lp.p_index > 0) {
+            heading_to_predecessor = lp.p.computeHeadingToPoint(lane_points[lp.p_index - 1]);
+        } else {
+            heading_to_predecessor = lp.p.computeHeadingToPoint(lane_points[lp.p_index + 1]) + M_PI;
+        }
+        if (lp.p_index < (n_points - 1)) {
+            heading_to_successor = lp.p.computeHeadingToPoint(lane_points[lp.p_index + 1]);
+        } else {
+            heading_to_successor = lp.p.computeHeadingToPoint(lane_points[lp.p_index - 1]) - M_PI;
+        }
+
+        // compute closest match
+        double heading_predecessor_diff = fabs(
+            fmod(heading_target, 2 * M_PI) - fmod(heading_to_predecessor, 2 * M_PI));
+        double heading_successor_diff = fabs(
+            fmod(heading_target, 2 * M_PI) - fmod(heading_to_successor, 2 * M_PI));
+        if (heading_predecessor_diff < heading_successor_diff) {
+            return heading_to_predecessor;
+        } else {
+        }
+    }
+    return heading_target;
+}
+
+/* function to get the angular difference between two directions. angle in ]-180, 180].
+   Computes the inner angle between two directions.
+   WARNING: has some inconsistencies to fix
+*/
+double Map::getAngularDifferenceFromAtan2(double heading_car, double heading_lane) {
+    double angular_difference = 0;
+    if (heading_car >= 0) {
+        // 0° <= car <= 180°
+        if (heading_lane > 0) {
+            // 0° <= lane <= 180°
+            angular_difference = fabs(heading_car - heading_lane);
+        } else {
+            // 0° > lane > -180°
+            angular_difference = heading_car - heading_lane;
+            // or modulo
+            if (angular_difference > M_PI) angular_difference = (2 * M_PI) - angular_difference;
+        }
+    } else {
+        // 0° > car > -180°
+        if (heading_lane > 0) {
+            // 0° <= lane <= 180°
+            angular_difference = fabs(heading_car - heading_lane);
+        } else {
+            // 0° > lane > -180°
+            angular_difference = fabs(heading_car) + heading_lane;
+            if (angular_difference > M_PI) angular_difference = (2 * M_PI) - angular_difference;
+        }
+    }
+    return angular_difference;
+}
+
+
+/* function to get the matching lane in a lanegroup given the car's heading */
+/* mapobjects::Uuid Map::getMatchingLane(
+    mapobjects::LaneGroup lg, mapobjects::LanePoint3D lp, mapobjects::Pose pose) {
+    // determine the correct lane using the car pose
+    // double normal_heading = getClosestLaneHeading(lp, pose);
+    // mapobjects::Point3D p_left_check = mapobjects::Point3D();
+    // mapobjects::Point3D p_right_check = mapobjects::Point3D();
+
+} */
+
+
+/* function to get the next lanepoint on a given lane,
+   or the endpoint if there is a laneobject/intersection.
+   If the lanepoint is interpolated, it returns the end lanepoint
+   of the lane segment the interpolated point is in.
+*/
+mapobjects::LanePoint3D Map::getNextLanePoint(mapobjects::LanePoint3D lp, double min_distance) {
+    (void) min_distance;  // added to silence compiler
+    if (lanepoint_debug2) std::cout << "MapLanePoint: searching next lanepoint..." << std::endl;
+
+    // get the current lane and points
+    mapobjects::Lane lane = getLaneFromLaneUuid(lp.lane_uuid);
+    std::vector<mapobjects::Point3D> lane_points = lane.getPoints();
+    int n_lanepoints = lane_points.size();
+
+    mapobjects::LanePoint3D lp_next = mapobjects::LanePoint3D(
+        lp.p, lp.p_index, lp.lane_uuid);
+
+    // get the next point on the lane
+    if (lp.p_index < (n_lanepoints - 1)) {
+        // check for laneobjects at each point
+        lp_next.p_index++;
+
+        if (lanepoint_debug2) std::cout << "MapLanePoint: incrementing point index:\t\t" \
+            << (lp.p_index) << "-> new: " << lp_next.p_index << std::endl;
+
+        if (!lp.isInterpolated) {
+            lp_next.lp_type = determineLanePointType(lp_next, false);
+        } else {
+            lp_next.lp_type = determineLanePointType(lp, lp_next, false);
+        }
+        lp_next.p = lane_points[lp_next.p_index];
+
+    // handle end of lane
+    } else {
+        if (lanepoint_debug) std::cout << "MapLanePoint: reached end of lane" << std::endl;
+
+        // lp_next.type = determineLanePointType(lp_next, true).type;
+        if (lp.lp_type.type == mapobjects::WaypointType::ROAD) {
+            // this means there is a successor
+            if (lanepoint_debug2) std::cout \
+                << "MapLanePoint: getting first point on next lane" << std::endl;
+            lp_next = getFirstLanePoint(getNextLaneUuid(lane));
+        } else {
+            if (getRealConnectionsOut(getLaneFromLaneUuid(lp_next.lane_uuid)).size() > 0) {
+                lp_next.lp_type = mapobjects::WaypointTypeHeader(mapobjects::WaypointType::JUNCTION);
+            } else {
+                lp_next.lp_type = mapobjects::WaypointTypeHeader(mapobjects::WaypointType::DEADEND);
+            }
+            
+        }
+    }
+    lp_next.lane_info = getLaneInfo(lp_next.lane_uuid);
+    return lp_next;
+}
+
+/* helper function to get only those inhcoming connections which are not in the same lanegroup */
+std::vector<mapobjects::Uuid> Map::getRealConnectionsIn(const mapobjects::Lane& lane) {
+    // get lane connections
+    std::vector<mapobjects::Uuid> l_connections_in = lane.getConnectionsIn();
+    int n_connections_in = l_connections_in.size();
+    // get all lanes in the parent lanegroup
+    mapobjects::LaneGroup lg_current = lanegroup_storage[
+        lanegroup_uuids.at(getLaneGroupUuidFromLaneUuid(lane.getUuid()).getUuidValue())];
+    std::vector<mapobjects::Uuid> lg_lanes_left_ids = lg_current.getLanesLeft();
+    std::vector<mapobjects::Uuid> lg_lanes_right_ids = lg_current.getLanesRight();
+    std::vector<mapobjects::Uuid> lg_lanes_ids;
+    lg_lanes_ids.insert(lg_lanes_ids.end(), lg_lanes_left_ids.begin(), lg_lanes_left_ids.end());
+    lg_lanes_ids.insert(lg_lanes_ids.end(), lg_lanes_right_ids.begin(), lg_lanes_right_ids.end());
+    int n_lg_lanes = lg_lanes_ids.size();
+    // get only the connections to inside of the lg
+    std::vector<mapobjects::Uuid> l_real_connections_in = std::vector<mapobjects::Uuid>();
+    for (int i = 0; i < n_connections_in; i++) {
+        bool match_found = false;
+        for (int j = 0; j < n_lg_lanes; j++) {
+            if (l_connections_in[i].equals(lg_lanes_ids[j])) {
+                match_found = true;
+            }
+        }
+        if (!match_found) {
+            l_real_connections_in.push_back(l_connections_in[i]);
+        }
+    }
+    return l_real_connections_in;
+}
+
+/* helper function to determine if next lane is a junction  */
+bool Map::checkSuccessorIsJunction(const mapobjects::Lane& lane) {
+    if (static_cast<int>(getRealConnectionsOut(lane).size()) > 1) {
+        return true;
+    }
+    return false;
+}
+
+/* helper function to determine if lane is a dead end  */
+bool Map::checkLaneIsDeadend(const mapobjects::Lane& lane) {
+    if (static_cast<int>(getRealConnectionsOut(lane).size()) < 1) {
+        return true;
+    }
+    return false;
+}
+
+/* function to determine the type of a lanepoint.
+   For stoplines/crosswalks, always look back to the lane segment from previous lp to current lp
+   Assumes previous lp to be not interpolated.
+*/
+mapobjects::WaypointTypeHeader Map::determineLanePointType(
+    const mapobjects::LanePoint3D& lp, bool is_endpoint) {
+    mapobjects::Lane lane = getLaneFromLaneUuid(lp.lane_uuid);
+    mapobjects::WaypointTypeHeader lp_type;
+
+    if (lanepoint_debug) std::cout << "MapLanePoint: determining lp type" << std::endl;
+
+    // handle general cases independent of is_endpoint first
+    //   check for stopline
+    std::vector<mapobjects::Uuid> lane_stoplines = getLaneStoplines(lp.lane_uuid);
+    int n_lane_stoplines = lane_stoplines.size();
+    if (n_lane_stoplines > 0) {
+        if (lanepoint_debug) std::cout << "checking for stoplines" << std::endl;
+        // check all stoplines associated with the lane
+        for (int i = 0; i < n_lane_stoplines; i++) {
+            double stopline_offset = round(laneobject_storage[
+                laneobject_uuids.at(lane_stoplines[i].getUuidValue())]->getOffset() * 1000) / 1000;
+
+            // handle both not/interpolated lps at the same time
+            double offset_lp_prev = \
+                round(getOffsetAlongLane(getPreviousLanePoint(lp)) * 1000) / 1000;
+            double offset_lp_curr = \
+                round(getOffsetAlongLane(lp) * 1000) / 1000;
+
+            if (lanepoint_debug2) {
+                std::cout << "offset prev: " \
+                    << std::setprecision(std::numeric_limits<long double>::digits10 + 1) \
+                    << offset_lp_prev << std::endl;
+                std::cout << "offset curr: " \
+                    << std::setprecision(std::numeric_limits<long double>::digits10 + 1) \
+                    << offset_lp_curr << std::endl;
+                std::cout << "offset stopline: " \
+                    << std::setprecision(std::numeric_limits<long double>::digits10 + 1) \
+                    << stopline_offset << std::endl;
+            }
+
+            // check if stopline is in interval
+            if (lp.p_index > 0) {
+                if (stopline_offset > offset_lp_prev && stopline_offset <= offset_lp_curr) {
+                    lp_type.type = mapobjects::WaypointType::STOPLINE;
+                    lp_type.offset = stopline_offset;
+
+                    if (lanepoint_debug) std::cout \
+                        << "MapLanePointType: lp is stopline" << std::endl;
+                    return lp_type;
+                }
+            } else {
+                // the lp is the first on the lane, so offset_lp_prev = offset_lp_curr
+                if (stopline_offset >= offset_lp_prev && stopline_offset <= offset_lp_curr) {
+                    lp_type.type = mapobjects::WaypointType::STOPLINE;
+                    lp_type.offset = stopline_offset;
+
+                    if (lanepoint_debug) std::cout \
+                        << "MapLanePointType: lp is stopline" << std::endl;
+                    return lp_type;
+                }
+            }
+        }
+    }
+    //   check for crosswalk
+    std::vector<mapobjects::Uuid> lane_crosswalks = getLaneCrosswalks(lp.lane_uuid);
+    int n_lane_crosswalks = lane_crosswalks.size();
+    if (n_lane_crosswalks > 0) {
+        if (lanepoint_debug) std::cout << "checking for crosswalks" << std::endl;
+        // check all crosswalks associated with the lane
+        for (int i = 0; i < n_lane_crosswalks; i++) {
+            double crosswalk_offset = round(getCrosswalkOffset(
+                lane_crosswalks[i],
+                lp.lane_uuid) * 1000) / 1000;
+
+            // handle both not/interpolated lps at the same time
+            double offset_lp_prev = \
+                round(getOffsetAlongLane(getPreviousLanePoint(lp)) * 1000) / 1000;
+            double offset_lp_curr = \
+                round(getOffsetAlongLane(lp) * 1000) / 1000;
+
+            if (lanepoint_debug2) {
+                std::cout << "offset prev: " \
+                    << std::setprecision(std::numeric_limits<long double>::digits10 + 1) \
+                    << offset_lp_prev << std::endl;
+                std::cout << "offset curr: " \
+                    << std::setprecision(std::numeric_limits<long double>::digits10 + 1) \
+                    << offset_lp_curr << std::endl;
+                std::cout << "offset crosswalk: " \
+                    << std::setprecision(std::numeric_limits<long double>::digits10 + 1) \
+                    << crosswalk_offset << std::endl;
+            }
+
+            // check if crosswalk is in interval
+            if (lp.p_index > 0) {
+                if (crosswalk_offset > offset_lp_prev && crosswalk_offset <= offset_lp_curr) {
+                    lp_type.type = mapobjects::WaypointType::CROSSWALK;
+                    lp_type.offset = crosswalk_offset;
+
+                    if (lanepoint_debug) std::cout \
+                        << "MapLanePointType: lp is crosswalk" << std::endl;
+                    return lp_type;
+                }
+            } else {
+                // the lp is the first on the lane, so offset_lp_prev = offset_lp_curr
+                if (crosswalk_offset >= offset_lp_prev && crosswalk_offset <= offset_lp_curr) {
+                    lp_type.type = mapobjects::WaypointType::CROSSWALK;
+                    lp_type.offset = crosswalk_offset;
+
+                    if (lanepoint_debug) std::cout \
+                        << "MapLanePointType: lp is crosswalk" << std::endl;
+                    return lp_type;
+                }
+            }
+        }
+    }
+
+    // handle special endpoint cases
+    if (is_endpoint || lp.p_index == static_cast<int>(lane.getPoints().size() - 1)) {
+        if (lanepoint_debug) std::cout << "MapLanePointType: lanepoint marked to be endpoint" \
+            << std::endl;
+
+        std::vector<mapobjects::Uuid> connections_out = getRealConnectionsOut(lane);
+        int n_connections_out = connections_out.size();
+        if (n_connections_out > 1) {
+            if (waypoint_debug) std::cout << "MapLanePointType: lp is junction" << std::endl;
+
+            lp_type.type = mapobjects::WaypointType::JUNCTION;
+            return lp_type;
+        } else if (n_connections_out < 1) {
+            if (lanepoint_debug) std::cout << "MapLanePointType: lp is deadend" << std::endl;
+
+            lp_type.type = mapobjects::WaypointType::DEADEND;
+            return lp_type;
+        }
+    }
+
+    if (lanepoint_debug) std::cout << "MapLanePointType: lp is road" << std::endl;
+
+    lp_type.type = mapobjects::WaypointType::ROAD;
+    return lp_type;
+}
+/* function to determine the type of a lanepoint.
+   For stoplines/crosswalks, always look back to the lane segment from previous lp to current lp
+   Use this function if previous lp is interpolated.
+*/
+mapobjects::WaypointTypeHeader Map::determineLanePointType(
+    const mapobjects::LanePoint3D& lp_prev, const mapobjects::LanePoint3D& lp,
+    bool is_endpoint) {
+    mapobjects::WaypointTypeHeader lp_type;
+
+    if (lanepoint_debug) std::cout << "determining lp type from interpolated" << std::endl;
+
+    if (!lp_prev.lane_uuid.equals(lp.lane_uuid)) {
+        std::cout << "MapDetermineLanePointType: ERROR: lanepoints have different lane uuids!" \
+            << std::endl;
+        lp_type.type = mapobjects::WaypointType::ERROR;
+        return lp_type;
+    }
+    mapobjects::Lane lane = getLaneFromLaneUuid(lp.lane_uuid);
+
+    // handle general cases independent of is_endpoint first
+    //   check for stopline
+    std::vector<mapobjects::Uuid> lane_stoplines = getLaneStoplines(lp.lane_uuid);
+    int n_lane_stoplines = lane_stoplines.size();
+    if (n_lane_stoplines > 0) {
+        if (lanepoint_debug) std::cout << "checking for stoplines" << std::endl;
+        // check all stoplines associated with the lane
+        for (int i = 0; i < n_lane_stoplines; i++) {
+            double stopline_offset = round(laneobject_storage[
+                laneobject_uuids.at(lane_stoplines[i].getUuidValue())]->getOffset() * 1000) / 1000;
+
+            // calculate offset of previous interpolated lp
+            double offset_lp_prev = \
+                round(getOffsetAlongLane(lp_prev) * 1000) / 1000;
+            double offset_lp_curr = \
+                round(getOffsetAlongLane(lp) * 1000) / 1000;
+
+            if (lanepoint_debug2) {
+                std::cout << "offset prev (interpolated): " \
+                    << std::setprecision(std::numeric_limits<long double>::digits10 + 1) \
+                    << offset_lp_prev << std::endl;
+                std::cout << "offset curr: " \
+                    << std::setprecision(std::numeric_limits<long double>::digits10 + 1) \
+                    << offset_lp_curr << std::endl;
+                std::cout << "offset stopline: " \
+                    << std::setprecision(std::numeric_limits<long double>::digits10 + 1) \
+                    << stopline_offset << std::endl;
+            }
+
+            // check if stopline is in interval
+            if ((stopline_offset > (offset_lp_prev + STOPLINE_MIN_SEPARATOR)) \
+                && (stopline_offset <= offset_lp_curr)) {
+                lp_type.type = mapobjects::WaypointType::STOPLINE;
+                lp_type.offset = stopline_offset;
+
+                if (lanepoint_debug) std::cout \
+                    << "MapLanePointType: lp is stopline" << std::endl;
+                return lp_type;
+            }
+        }
+    }
+    //   check for crosswalk
+    std::vector<mapobjects::Uuid> lane_crosswalks = getLaneCrosswalks(lp.lane_uuid);
+    int n_lane_crosswalks = lane_crosswalks.size();
+    if (n_lane_crosswalks > 0) {
+        if (lanepoint_debug) std::cout << "checking for crosswalks" << std::endl;
+        // check all crosswalks associated with the lane
+        for (int i = 0; i < n_lane_crosswalks; i++) {
+            double crosswalk_offset = round(getCrosswalkOffset(
+                lane_crosswalks[i],
+                lp.lane_uuid) * 1000) / 1000;
+
+            // handle both not/interpolated lps at the same time
+            double offset_lp_prev = \
+                round(getOffsetAlongLane(lp_prev) * 1000) / 1000;
+            double offset_lp_curr = \
+                round(getOffsetAlongLane(lp) * 1000) / 1000;
+
+            if (lanepoint_debug2) {
+                std::cout << "offset prev (interpolated): " \
+                    << std::setprecision(std::numeric_limits<long double>::digits10 + 1) \
+                    << offset_lp_prev << std::endl;
+                std::cout << "offset curr: " \
+                    << std::setprecision(std::numeric_limits<long double>::digits10 + 1) \
+                    << offset_lp_curr << std::endl;
+                std::cout << "offset crosswalk: " \
+                    << std::setprecision(std::numeric_limits<long double>::digits10 + 1) \
+                    << crosswalk_offset << std::endl;
+            }
+
+            // check if crosswalk is in interval
+            if (lp.p_index > 0) {
+                if (crosswalk_offset > offset_lp_prev && crosswalk_offset <= offset_lp_curr) {
+                    lp_type.type = mapobjects::WaypointType::CROSSWALK;
+                    lp_type.offset = crosswalk_offset;
+
+                    if (lanepoint_debug) std::cout \
+                        << "MapLanePointType: lp is crosswalk" << std::endl;
+                    return lp_type;
+                }
+            } else {
+                // the lp is the first on the lane, so offset_lp_prev = offset_lp_curr
+                if (crosswalk_offset >= offset_lp_prev && crosswalk_offset <= offset_lp_curr) {
+                    lp_type.type = mapobjects::WaypointType::CROSSWALK;
+                    lp_type.offset = crosswalk_offset;
+
+                    if (lanepoint_debug) std::cout \
+                        << "MapLanePointType: lp is crosswalk" << std::endl;
+                    return lp_type;
+                }
+            }
+        }
+    }
+
+    // handle special endpoint cases
+    if (is_endpoint || lp.p_index == static_cast<int>(lane.getPoints().size() - 1)) {
+        if (lanepoint_debug) std::cout << "MapLanePointType: lanepoint marked to be endpoint" \
+            << std::endl;
+
+        std::vector<mapobjects::Uuid> connections_out = getRealConnectionsOut(lane);
+        int n_connections_out = connections_out.size();
+        if (n_connections_out > 1) {
+            if (waypoint_debug) std::cout << "MapLanePointType: lp is junction" << std::endl;
+
+            lp_type.type = mapobjects::WaypointType::JUNCTION;
+            return lp_type;
+        } else if (n_connections_out < 1) {
+            if (lanepoint_debug) std::cout << "MapLanePointType: lp is deadend" << std::endl;
+
+            lp_type.type = mapobjects::WaypointType::DEADEND;
+            return lp_type;
+        }
+    }
+
+    if (lanepoint_debug) std::cout << "MapLanePointType: lp is road" << std::endl;
+
+    lp_type.type = mapobjects::WaypointType::ROAD;
+    return lp_type;
+}
+
+/* helper function to get the previous lanepoint on a lane.
+   If the given lanepoint is the first on the lane, it is returned.
+   For interpolated lanepoints, the lp before the interpolated one is returned.
+*/
+mapobjects::LanePoint3D Map::getPreviousLanePoint(const mapobjects::LanePoint3D& lp) {
+    std::vector<mapobjects::Point3D> points_lane = getLanePoints(lp.lane_uuid);
+    if (lanepoint_debug) std::cout << "MapLanePoint: getting previous lp" << std::endl;
+
+    if (lp.p_index > 0) {
+        mapobjects::LanePoint3D lp_prev = mapobjects::LanePoint3D();
+        lp_prev.lane_uuid = lp.lane_uuid;
+        lp_prev.p_index = lp.p_index - 1;
+
+        mapobjects::Point3D p_prev = points_lane[lp.p_index-1];
+        if (lp.isInterpolated) {
+            p_prev = points_lane[lp.p_index];
+            lp_prev.p_index = lp.p_index;
+        }
+        lp_prev.p = p_prev;
+
+        // lp_prev.lp_type = determineLanePointType(lp_prev, false);  not needed right now
+        return lp_prev;
+    } else {
+        return lp;
+    }
+}
+
+/* helper function to get first point on a lane */
+mapobjects::LanePoint3D Map::getFirstLanePoint(const mapobjects::Uuid& lane_uuid) {
+    if (lanepoint_debug) std::cout << "MapLanePoint: getting first lanepoint on new lane" \
+        << std::endl;
+
+    std::vector<mapobjects::Point3D> lane_points = getLanePoints(lane_uuid);
+    mapobjects::LanePoint3D lp = mapobjects::LanePoint3D();
+
+    // if lane is valid
+    if (lane_points.size() > 0) {
+        lp.p_index = 0;
+        lp.lane_uuid = lane_uuid;
+        lp.p = lane_points[lp.p_index];
+        // std::cout << "lanepoint index: " << lp.p_index << std::endl;
+        // std::cout << "lanepoint p(x,y): " << lp.p.getX() << "  " << lp.p.getY() << std::endl;
+        lp.lp_type = determineLanePointType(lp, false);
+    } else {
+        lp.lp_type.type = mapobjects::WaypointType::ERROR;
+    }
+    lp.lane_info = getLaneInfo(lp.lane_uuid);
+    return lp;
+}
+
+/* helper function to get the uuid of the next lane.
+   Assumes one outgoing lane.
+*/
+mapobjects::Uuid Map::getNextLaneUuid(const mapobjects::Uuid& lane_uuid) {
+    return getNextLaneUuids(lane_uuid)[0];
+}
+/* helper function to get the uuid of the next lane.
+   Assumes one outgoing lane.
+*/
+mapobjects::Uuid Map::getNextLaneUuid(const mapobjects::Lane& lane) {
+    return getNextLaneUuids(lane)[0];
+}
+
+/* helper function to get the uuids of the next lanes. */
+std::vector<mapobjects::Uuid> Map::getNextLaneUuids(const mapobjects::Uuid& lane_uuid) {
+    return getRealConnectionsOut(getLaneFromLaneUuid(lane_uuid));
+}
+/* helper function to get the uuids of the next lanes. */
+std::vector<mapobjects::Uuid> Map::getNextLaneUuids(const mapobjects::Lane& lane) {
+    return getRealConnectionsOut(lane);
+}
+
+/* function to get all the stopline laneobjects associated with a specific lane */
+std::vector<mapobjects::Uuid> Map::getLaneStoplines(const mapobjects::Uuid& lane_uuid) {
+    std::unordered_map<std::string, std::vector<mapobjects::Uuid>>::const_iterator it = \
+        lane_stoplines_lookup.find(lane_uuid.getUuidValue());
+    if (it != lane_stoplines_lookup.end()) {
+        return it->second;
+    }
+    return std::vector<mapobjects::Uuid>();
+    // old
+    /* int n_laneobjects = laneobject_storage.size();
+    std::vector<mapobjects::Uuid> stoplines_lane = lane_stoplines_lookup.;
+    std::vector<mapobjects::Uuid> stoplines_lane = std::vector<mapobjects::Uuid>();
+    for (int i = 0; i < n_laneobjects; i++) {
+        if (laneobject_storage[i]->getLaneObjectType() == \
+            mapobjects::LaneObjectType::LO_STOPLINE) {
+            if (containsUuid(laneobject_storage[i]->getLaneIds(), lane_uuid)) {
+                stoplines_lane.push_back(laneobject_storage[i]->getUuid());
+            }
+        }
+    }
+    return stoplines_lane; */
+}
+
+/* function to get all the crosswalk laneobjects associated with a specific lane */
+std::vector<mapobjects::Uuid> Map::getLaneCrosswalks(const mapobjects::Uuid& lane_uuid) {
+    std::unordered_map<std::string, std::vector<mapobjects::Uuid>>::const_iterator it = \
+        lane_crosswalks_lookup.find(lane_uuid.getUuidValue());
+    if (it != lane_crosswalks_lookup.end()) {
+        return it->second;
+    }
+    return std::vector<mapobjects::Uuid>();
+}
+
+/* function to get all the parking laneobjects associated with a specific lane */
+std::vector<mapobjects::Uuid> Map::getLaneParkings(const mapobjects::Uuid& lane_uuid) {
+    std::unordered_map<std::string, std::vector<mapobjects::Uuid>>::const_iterator it = \
+        lane_parking_lookup.find(lane_uuid.getUuidValue());
+    if (it != lane_parking_lookup.end()) {
+        return it->second;
+    }
+    return std::vector<mapobjects::Uuid>();
+}
+
+std::vector<mapobjects::Uuid> Map::getAllParkingLots() {
+    std::vector<mapobjects::Uuid> parking_uuids = std::vector<mapobjects::Uuid>();
+    for (std::unordered_map<std::string, std::vector<mapobjects::Uuid>>::const_iterator it = \
+        lane_parking_lookup.begin();
+        it != lane_parking_lookup.end(); it++) {
+        int n_parkings = it->second.size();
+        for (int i = 0; i < n_parkings; i++) {
+            parking_uuids.push_back(it->second[i]);
+        }
+    }
+    return parking_uuids;
+}
+
+/* helper function to check if a certain uuid is contained within a uuid vector */
+bool Map::containsUuid(std::vector<mapobjects::Uuid> uuids, mapobjects::Uuid uuid) {
+    int n_uuids = uuids.size();
+    for (int i = 0; i < n_uuids; i++) {
+        if (uuids[i].equals(uuid)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* helper function to get all the lanes associated with a lanegroup */
+std::vector<mapobjects::Uuid> Map::getAllLanesFromLanegroup(mapobjects::Uuid lg_uuid) {
+    std::vector<mapobjects::Uuid> lg_lanes_uuids = std::vector<mapobjects::Uuid>();
+
+    std::vector<mapobjects::Uuid> lg_lanes_left = lanegroup_storage[
+        lanegroup_uuids.at(lg_uuid.getUuidValue())].getLanesLeft();
+    int n_lanes_left = lg_lanes_left.size();
+    for (int i = 0; i < n_lanes_left; i++) {
+        lg_lanes_uuids.push_back(lg_lanes_left[i]);
+    }
+    std::vector<mapobjects::Uuid> lg_lanes_right = lanegroup_storage[
+        lanegroup_uuids.at(lg_uuid.getUuidValue())].getLanesRight();
+    int n_lanes_right = lg_lanes_right.size();
+    for (int i = 0; i < n_lanes_right; i++) {
+        lg_lanes_uuids.push_back(lg_lanes_right[i]);
+    }
+    return lg_lanes_uuids;
+}
+
+/* function to generate the lane meta information using its uuid */
+mapobjects::LaneInfo Map::getLaneInfo(mapobjects::Uuid lane_uuid) {
+    const mapobjects::Lane& lane = getLaneFromLaneUuid(lane_uuid);
+    mapobjects::LaneInfo lane_info = mapobjects::LaneInfo();
+    int height = lane.getHeight();
+    // set Streetdesigner/ADTF special cases
+    switch (height) {
+        case 1:
+            lane_info.is_ground = false;
+            break;
+        case 2:
+            lane_info.is_ramp_up = true;
+            break;
+        case 3:
+            lane_info.is_ramp_down = true;
+            break;
+        case 4:
+            lane_info.is_merging = true;
+            break;
+        case 5:
+            lane_info.is_tunnel = true;
+            break;
+        default:
+            break;
+    }
+    // check for lane_objects
+    if (lane_crosswalks_lookup.find(lane_uuid.getUuidValue()) \
+        != lane_crosswalks_lookup.end()) {
+        lane_info.has_crosswalks = true;
+    }
+    if (lane_stoplines_lookup.find(lane_uuid.getUuidValue()) \
+        != lane_stoplines_lookup.end()) {
+        lane_info.has_stoplines = true;
+    }
+    if (lane_parking_lookup.find(lane_uuid.getUuidValue()) \
+        != lane_parking_lookup.end()) {
+        lane_info.has_parking = true;
+    }
+    // check if overtaking is permitted
+    mapobjects::LaneMarkingType lmt = lanemarking_storage[
+            lanemarking_uuids.at(
+                lane.getLaneMarkingContainer().getLaneMarkingsLeft()[
+                    0].getUuidValue())].getLaneMarkingType();
+    if ((lmt == mapobjects::LaneMarkingType::CENTER_SOLID) \
+         || (lmt == mapobjects::LaneMarkingType::SOLID)) {
+        lane_info.no_overtaking = true;
+    }
+    return lane_info;
+}
+
+// ____________________________________________________________________________
+/* map point projections */
+
+/* function to get the euclidean offset of a lanepoint on a lane along the centerline
+   in the direction of the lane
+*/
+double Map::getOffsetAlongLane(const mapobjects::LanePoint3D& lp) {
+    std::vector<mapobjects::Point3D> points = getLanePoints(lp.lane_uuid);
+    double offset = 0;
+
+    for (int i = 0; i < lp.p_index; i++) {
+        offset += points[i].computeDistance(points[i+1]);
+    }
+    // by convention, for interpolated lanepoints, its p_index is to the previous lp
+    if (lp.isInterpolated) {
+        offset += points[lp.p_index].computeDistance(lp.p);
+    }
+    // if (lp.p_index > n_points)  {
+    //     offset = 1e9;
+    // }
+    return offset;
+}
+
+/* function to compute the offset between a specific lanepoint and a mapobjects::Point3D
+*/
+double Map::getOffsetToPoint3D(mapobjects::LanePoint3D lp, mapobjects::Point3D p) {
+    return lp.p.computeDistance(p);
+}
+
+/* function to return a projected Point3D along a lane segment
+   given a specific offset along the lane.
+   Using additive euclidean distance along centerline for point interpolation */
+mapobjects::Point3D Map::getPoint3DFromLaneOffset(
+    const mapobjects::LanePoint3D& lp, const double& offset) {
+    std::vector<mapobjects::Point3D> points_lane = getLanePoints(lp.lane_uuid);
+    int n_points = points_lane.size();
+    double lane_offset = 0;
+    int lane_position = 0;
+    // iterate along lane center line
+    for (int i = 0; i < (n_points - 1); i++) {
+        lane_position = i;
+        double delta_offset = points_lane[i].computeDistance(points_lane[i+1]);
+        if (lane_offset + delta_offset > offset) {
+            // get the point before the offset is exceeded
+            break;
+        } else {
+            lane_offset += points_lane[i].computeDistance(points_lane[i+1]);
+        }
+    }
+    // interpolate the new point along the found lane segment
+    double lane_segment_heading = points_lane[lane_position].computeHeadingToPoint(
+        points_lane[lane_position+1]);
+    double offset_delta = offset - lane_offset;  // positive
+    double lane_segment_length = \
+        points_lane[lane_position].computeDistance(points_lane[lane_position+1]);
+    double x_interpolated = \
+        points_lane[lane_position].getX() + cos(lane_segment_heading) * offset_delta;
+    double y_interpolated = \
+        points_lane[lane_position].getY() + sin(lane_segment_heading) * offset_delta;
+    double z_interpolated = 0;
+    if (points_lane[lane_position].getZ() > 0 && points_lane[lane_position+1].getZ() > 0) {
+        z_interpolated = points_lane[lane_position].getZ() + (
+            points_lane[lane_position+1].getZ() - points_lane[lane_position].getZ()) * (
+                offset_delta / lane_segment_length);
+    }
+    return mapobjects::Point3D(x_interpolated, y_interpolated, z_interpolated);
+}
+
+/* function to return a projected Point3D along a lane segment
+   given a specific offset starting from the lanepoint provided.
+   Using euclidean distance along centerline for point interpolation */
+mapobjects::Point3D Map::getPoint3DFromLanePointOffset(
+    const mapobjects::LanePoint3D& lp, const double& offset) {
+    double lane_segment_heading = getLanePointDirection(lp);
+    double x_interpolated = \
+        lp.p.getX() + cos(lane_segment_heading) * offset;
+    double y_interpolated = \
+        lp.p.getY() + sin(lane_segment_heading) * offset;
+    double z_interpolated = lp.p.getZ();
+    return mapobjects::Point3D(x_interpolated, y_interpolated, z_interpolated);
+}
+
+/* function to get the intersection point of two line segments if it exists.
+   See:
+   https://stackoverflow.com/questions/563198/how-do-you-detect-where-two-line-segments-intersect
+   Be aware of the error on the website. The point should be computed with p' = p + u * r.
+   Reduces dimensionality to 2D. z = 0.
+*/
+mapobjects::Point3D Map::getLaneSegmentIntersection(
+    mapobjects::Point3D lane1_p1,
+    mapobjects::Point3D lane1_p2,
+    mapobjects::Point3D lane2_p1,
+    mapobjects::Point3D lane2_p2) {
+    double p_1_x = lane1_p1.getX();
+    double p_1_y = lane1_p1.getY();
+    double p_2_x = lane1_p2.getX();
+    double p_2_y = lane1_p2.getY();
+    double r_x = p_2_x - p_1_x;
+    double r_y = p_2_y - p_1_y;
+    double q_1_x = lane2_p1.getX();
+    double q_1_y = lane2_p1.getY();
+    double q_2_x = lane2_p2.getX();
+    double q_2_y = lane2_p2.getY();
+    double s_x = q_2_x - q_1_x;
+    double s_y = q_2_y - q_1_y;
+
+    // double h1 = lane1_p1.computeHeadingToPoint(lane1_p2);
+    // double h2 = lane2_p1.computeHeadingToPoint(lane2_p2);
+
+    double num1 = crossProduct2D((q_1_x - p_1_x), (q_1_y - p_1_y), r_x, r_y);
+    double num2 = crossProduct2D((q_1_x - p_1_x), (q_1_y - p_1_y), s_x, s_y);
+    double den = crossProduct2D(r_x, r_y, s_x, s_y);
+
+    double x_new = p_1_x;
+    double y_new = p_1_y;
+
+    if (num2 == 0 && den == 0) {
+        if (geometry_debug) std::cout << "MapGeometry: ERROR: lanesegments collinear" << std::endl;
+        throw Map::GeometryException::COLLINEAR_ERROR;
+    } else if (den == 0 && num2 != 0) {
+        if (geometry_debug) std::cout << "MapGeometry: ERROR: lanesegments parallel" << std::endl;
+        throw Map::GeometryException::PARALLEL_ERROR;
+    } else {
+        double t = num1 / den;
+        double u = num2 / den;
+        // solution and intersection
+        if (t >= 0 && t <= 1 && u >= 0 && u <= 1) {
+            x_new = p_1_x + u * r_x;
+            y_new = p_1_y + u * r_y;
+        } else {
+            if (geometry_debug) std::cout \
+                << "MapGeometry: ERROR: no intersection between lane segments" << std::endl;
+            throw Map::GeometryException::NOT_INTERSECTING_ERROR;
+        }
+    }
+    return mapobjects::Point3D(x_new, y_new, 0);
+}
+
+/* helper function to compute the cross product of two 2D vectors */
+double Map::crossProduct2D(double x1, double y1, double x2, double y2) {
+    return (x1*y2) - (y1*x2);
+}
+
+/* function to get the crosswalk offset given a crosswalk uuid and the lane on
+   which the offset should be computed on.
+   return 1e9 if could not compute -> like no crosswalk detected
+*/
+double Map::getCrosswalkOffset(mapobjects::Uuid crosswalk_uuid, mapobjects::Uuid lane_uuid) {
+    double crosswalk_lg_center_offset = laneobject_storage[
+        laneobject_uuids.at(crosswalk_uuid.getUuidValue())]->getOffset();
+
+    // get the parent lg
+    mapobjects::LaneGroup crosswalk_lg = lanegroup_storage[
+        lanegroup_uuids.at(
+            laneobject_storage[
+                laneobject_uuids.at(
+                    crosswalk_uuid.getUuidValue())]->getLaneGroupId().getUuidValue())];
+
+    if (crosswalk_lg.getLanesRight().size() > 0) {
+        // get the right lane
+        mapobjects::Uuid right_lane_uuid = crosswalk_lg.getLanesRight()[0];
+        // get its left lane marking points (this is the offset)
+        std::vector<mapobjects::Point3D> left_marking_points = lanemarking_storage[
+            lanemarking_uuids.at(
+                lane_storage[
+                    lane_uuids.at(right_lane_uuid.getUuidValue())
+                ].getLaneMarkingContainer().getLaneMarkingsLeft()[0].getUuidValue())
+        ].getPoints();
+        int n_lanemarking_points = left_marking_points.size();
+        // std::cout << "left lanemarkings: " << n_lanemarking_points << std::endl;
+
+        // get the relevant points
+        int p_index_start = 0;
+        int p_index_end = 0;
+        int offset_distance = 0;
+        for (int i = 0; i < (n_lanemarking_points - 1); i++) {
+            offset_distance += left_marking_points[i].computeDistance(left_marking_points[i+1]);
+            // std::cout << "offset dist i: " << i << "   " << offset_distance << std::endl;
+            // if the crosswalk is reached
+            if (round(offset_distance * 1000) / 1000 >= \
+                round(crosswalk_lg_center_offset * 1000) / 1000) {
+                p_index_start = i;
+                p_index_end = i + 1;
+                // std::cout << "lm offset exceeded: " << round(offset_distance * 1000) / 1000
+                //     << " " << round(crosswalk_lg_center_offset * 1000) / 1000 << std::endl;
+                break;
+            }
+        }
+        // std::cout << "offset dist" << offset_distance << std::endl;
+        // std::cout << "crosswalk center offset dist" << crosswalk_lg_center_offset << std::endl;
+        // std::cout << "lm i: " << p_index_start << std::endl;
+
+        // compute the normal heading
+        double point_segment_heading = left_marking_points[p_index_start].computeHeadingToPoint(
+            left_marking_points[p_index_end]);
+
+        // get the points of the line segment
+        double offset_delta = offset_distance - crosswalk_lg_center_offset;
+        mapobjects::Point3D p_1 = mapobjects::Point3D(
+            left_marking_points[p_index_start].getX() + cos(point_segment_heading) * offset_delta,
+            left_marking_points[p_index_start].getY() + sin(point_segment_heading) * offset_delta,
+            left_marking_points[p_index_start].getZ());
+        // rotate heading 90 degrees to the right -> pointing to the lane centerline
+        point_segment_heading = normalizeToAtan2(point_segment_heading + M_PI_2);
+        // the length of the line segment to cross with the lane segments
+        double line_segment_length = 100;  // in cm
+        mapobjects::Point3D p_2 = mapobjects::Point3D(
+            p_1.getX() \
+                + cos(point_segment_heading) * line_segment_length,
+            p_1.getY() \
+                + sin(point_segment_heading) * line_segment_length,
+            p_1.getZ());
+        // project the first point back along the normal direction to cover all lanes
+        p_1 = mapobjects::Point3D(
+            p_1.getX() + cos(point_segment_heading) * -line_segment_length,
+            p_1.getY() + sin(point_segment_heading) * -line_segment_length,
+            p_1.getZ());
+        if (geometry_debug) {
+            drawPoint3D(p_1, 3, 5);
+            drawPoint3D(p_2, 3, 5);
+            drawLine(p_1, p_2, 2);
+        }
+
+        // intersect the line segment with each lane segment on the lane
+        //   get the lane points
+        std::vector<mapobjects::Point3D> points_lane = getLanePoints(lane_uuid);
+        int n_points_lane = points_lane.size();
+        mapobjects::Point3D p_projected;
+        bool intersection_found = false;
+        int lane_segment_start_p_index = 0;
+
+        for (int i = 0; i < (n_points_lane - 1); i++) {
+            mapobjects::Point3D p_l_1 = points_lane[i];
+            mapobjects::Point3D p_l_2 = points_lane[i+1];
+            // intersect the lane segments, abort if match found
+            // catch geometry errors
+            try {
+                p_projected = getLaneSegmentIntersection(p_1, p_2, p_l_1, p_l_2);
+                intersection_found = true;
+                lane_segment_start_p_index = i;
+                if (geometry_debug) {
+                    drawPoint3D(p_l_1, 2, 5);
+                    drawPoint3D(p_l_2, 2, 5);
+                    // drawPoint3D(p_projected, 5, 10);
+                }
+                break;
+            } catch (Map::GeometryException& e) {
+            }
+        }
+        if (!intersection_found) {
+            std::cout << \
+                "MapWaypoint: ERROR: could not compute projected Point3D for crosswalk position" \
+                << std::endl;
+            return 1e9;
+        }
+
+        // get the intersecting lanepoint
+        mapobjects::LanePoint3D lp_crosswalk = mapobjects::LanePoint3D();
+        lp_crosswalk.p_index = lane_segment_start_p_index;
+        lp_crosswalk.lp_type = mapobjects::WaypointTypeHeader(
+            mapobjects::WaypointType::INTERPOLATED);
+        lp_crosswalk.isInterpolated = true;
+        lp_crosswalk.lane_uuid = lane_uuid;
+        lp_crosswalk.p = p_projected;
+
+        // get the offset to the intersection point
+        double crosswalk_offset = getOffsetAlongLane(lp_crosswalk);
+
+        if (geometry_debug) \
+            drawPoint3D(getPoint3DFromLaneOffset(lp_crosswalk, crosswalk_offset), 4, 25);
+        return crosswalk_offset;
+    }
+
+    // if there are no right lanes -> required from Streetdesigner
+    std::cout << "MapWaypoint: ERROR: no right lane for crosswalk found" << std::endl;
+    return 1e9;
+}
+
+/* function to project a Point3D to a interpolated LanePoint on a lane */
+mapobjects::LanePoint3D Map::projectPoint3DToLane(
+    mapobjects::Point3D p, mapobjects::Uuid lane_uuid) {
+    // get the lane points
+    std::vector<mapobjects::Point3D> lane_points = getLanePoints(lane_uuid);
+    int n_lane_points = lane_points.size();
+
+    int p_index_distance_min = 0;
+    double distance_min = 1e9;
+    for (int i = 0; i < n_lane_points; i++) {
+        double distance_to_p = p.computeDistance(lane_points[i]);
+        if (distance_to_p < distance_min) {
+            p_index_distance_min = i;
+            distance_min = distance_to_p;
+        }
+    }
+    bool is_endpoint = false;
+    if (p_index_distance_min == (n_lane_points - 1)) {
+        is_endpoint = true;
+    }
+    mapobjects::LanePoint3D lp = mapobjects::LanePoint3D(
+        lane_points[p_index_distance_min],
+        p_index_distance_min,
+        lane_uuid);
+    lp.lp_type = determineLanePointType(lp, is_endpoint);
+    lp.lane_info = getLaneInfo(lp.lane_uuid);
+    return lp;
+}

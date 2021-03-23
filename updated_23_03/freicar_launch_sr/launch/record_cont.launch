@@ -1,0 +1,14 @@
+<launch>
+
+<node name="serial_node" pkg="rosserial_python" type="serial_node.py" args="/dev/ttyACM0" output="screen"/>
+
+<node pkg="freicar_joy" type="freicar_joy_node" name="teleop" output="screen">
+ </node>
+
+<node pkg="joy" type="joy_node" name="joy" output="screen">
+ </node>
+
+
+ <node pkg="rosbag" type="record" name="rosbag_record" cwd="node" output="screen" args="record /tf /tf_static /zed_node/rgb/image_rect_color /zed_node/rgb/camera_info /zed_node/depth/depth_registered /t265/odom/sample /d435/aligned_depth_to_color/image_raw /d435/color/image_raw /d435/color/camera_info -o $(find raiscar)/recordings/"  />
+
+</launch>

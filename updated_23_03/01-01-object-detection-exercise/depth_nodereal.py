@@ -153,7 +153,6 @@ def depth_node():
     rospy.Subscriber('/freicar_1/sim/camera/depth/front/image_float', Image, callback=img_callback, queue_size=1)
 
 
-    depth_publisher = rospy.Publisher('/No_look/Seg_Predictions_Publisher', Image, queue_size=10)
 
     # init rosnode
     #rospy.init_node('Seg_Reg_node', anonymous=True)

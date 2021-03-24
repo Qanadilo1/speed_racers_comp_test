@@ -1,0 +1,11 @@
+<launch>
+<node pkg="freicar_bb_box_sr" type="img_sub_bb_pub.py" name="bb_box" output="screen">
+<arg name="-p"  type="str" value="project detection" />
+<arg name="-c"       type="int" value="0" />
+<arg name="-w"       type="str" value="'logs/freicar-detection/efficientdet-d0_95_166000.pth'" >
+<arg name="--nms_threshold"       type="double" value="0.5" />
+<arg name="--cuda"       type="boolean" value="true" />
+<arg name="--device"       type="int" value="0" />
+</node>
+
+</launch>

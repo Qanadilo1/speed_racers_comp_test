@@ -1,0 +1,23 @@
+<launch>
+<node pkg="timed_roslaunch" type="timed_roslaunch.sh"
+    args="1 freicar_agent sim_agent.launch name:=freicar_1 tf_name:=freicar_1 spawn/x:=0 spawn/y:=0 spawn/z:=0 spawn/heading:=20 use_yaml_spawn:=true sync_topic:=!" 
+    name="timed_roslaunch_1" output="screen" />
+
+  <node pkg="freicar_map_sr" type="freicar_map_sr_node" name="freicar_map" launch-prefix="bash -c 'sleep 31.1; $0 $@' ">
+  </node>
+
+
+<node pkg="timed_roslaunch" type="timed_roslaunch.sh"
+    args="15 freicar_localization_sr evaluate.launch" name="timed_roslaunch_2" output="screen" />
+<node pkg="timed_roslaunch" type="timed_roslaunch.sh"
+    args="34 freicar_control_sr start_controller.launch" name="timed_roslaunch_3" output="screen" />
+<!--
+    <node pkg="timed_roslaunch" type="timed_roslaunch.sh"
+    args="43 freicar_bb_box_sr bb_box.launch" name="timed_roslaunch_4" output="screen" />
+<node pkg="timed_roslaunch" type="timed_roslaunch.sh"
+    args="51 freicar_overtake_sr depth.launch" name="timed_roslaunch_5" output="screen" /> 
+    -->
+<node pkg="timed_roslaunch" type="timed_roslaunch.sh"
+    args="62 freicar_planner_sr planner.launch" name="timed_roslaunch_6" output="screen" />
+    
+</launch>

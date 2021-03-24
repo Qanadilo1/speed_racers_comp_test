@@ -1,0 +1,8 @@
+prefix=/home/freicar/freicar_ws/src/freicar-2020-exercises/04-01-control-exercise/freicar_control/cmake-build-debug/devel
+
+Name: freicar_control
+Description: Description of freicar_control
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

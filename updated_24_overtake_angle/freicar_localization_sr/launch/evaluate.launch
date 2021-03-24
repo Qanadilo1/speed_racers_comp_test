@@ -1,0 +1,22 @@
+<launch>
+
+
+
+<node pkg="image_transport" type="republish" name="decompressor" output="screen" args="compressed in:=/freicar_1/sim/camera/rgb/front/image raw out:=/freicar_1/sim/camera/rgb/front/image"/>
+
+<node pkg="freicar_sign_detect" type="freicar_sign_detect_node" name="sign_detector" output="screen"/>
+
+
+
+	<arg name="evaluate" default="true" />
+	<arg name="use_lane_regression" default="true" />
+
+	<node name="freicar_localization_sr" pkg="freicar_localization_sr" type="freicar_localization_sr_node" respawn="false" output="screen">
+		<param name="evaluate"  type="bool" value="$(arg evaluate)" />
+		<param name="use_lane_regression"       type="bool" value="$(arg use_lane_regression)" />
+	</node>
+
+
+
+</launch>
+

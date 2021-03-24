@@ -1,0 +1,31 @@
+cmake_minimum_required(VERSION 3.5.0)
+
+# used in node_graph
+find_package(nanoflann)
+# setting global variables
+set(MAPTHRIFT_DIR ${CMAKE_SOURCE_DIR}/MapThrift)
+set(MAPTHRIFT_INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/MapThrift)
+set(MAPLIB_DIR ${CMAKE_SOURCE_DIR}/MapCore)
+set(MAPLIB_INCLUDE_DIRS ${MAPLIB_DIR}/include)
+set(MAPLIB freicar_globalmap)
+# setting include directories
+include_directories(SYSTEM ${CMAKE_CURRENT_SOURCE_DIR}
+						   ${MAPTHRIFT_INCLUDE_DIRS}
+						   ${MAPLIB_INCLUDE_DIRS}
+)
+# building freicar_globalmap
+message(STATUS "compiling freicar_globalmap lib")
+add_library(freicar_globalmap SHARED ${MAPLIB_DIR}/src/freicar_map.cpp
+									 ${MAPLIB_DIR}/src/freicar_map_objects.cpp
+									 ${MAPLIB_DIR}/src/freicar_map_helper.cpp
+									 ${MAPLIB_DIR}/src/freicar_type_conversion.cpp
+                             		 ${MAPTHRIFT_DIR}/gen-cpp/map_data_structure_constants.cpp
+                             		 ${MAPTHRIFT_DIR}/gen-cpp/map_data_structure_types.cpp
+)
+
+# set_property(TARGET globalmap PROPERTY POSITION_INDEPENDENT_CODE ON)  # important ?
+set_target_properties(
+    freicar_globalmap PROPERTIES CXX_STANDARD 11  # important!
+)
+# linking relevant libraries
+target_link_libraries(freicar_globalmap PUBLIC nanoflann::nanoflann)

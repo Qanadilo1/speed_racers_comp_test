@@ -1,0 +1,36 @@
+<!-- creates a sim_only agent -->
+<launch>
+  <!-- necessary params -->
+  <arg name="name" default="freicar_4"/>
+
+
+  <!-- sensor/car related mappings -->
+  <remap from="brake_cmd" to="$(arg name)/brake_cmd"/>
+  <remap from="control_cmd" to="$(arg name)/control"/>
+  <remap from="control_mode" to="$(arg name)/control_mode"/>
+  <remap from="control_report" to="$(arg name)/control_report"/>
+  <remap from="battery_calibration" to="$(arg name)/battery_calibration"/>
+  <remap from="power_report" to="$(arg name)/power_report"/>
+
+  <node pkg="rosserial_python" type="serial_node.py" name="freicar_$(arg name)_serial" output="screen" args=" _port:=/dev/ttyACM0 _baud:=115200"/>
+
+  <include file="$(find freicar_demo_agent)/launch/real_demo.launch">
+    <arg name="name" value="$(arg name)" />
+  </include>
+  
+  # Remote controlled ###########################################################
+  <!--<remap from="control" to="$(arg name)/control"/>
+  <include file="$(find freicar_agent)/launch/real_agent.launch">
+    <arg name="name" value="$(arg name)" />
+  </include>
+  -->
+  <node pkg="freicar_joy" type="freicar_joy_node" name="$(arg name)_joy" output="screen" />
+  <node pkg="joy" type="joy_node" name="$(arg name)_joy_node" output="screen" />
+  ################################################################################
+
+  <node pkg="freicar_agent" type="suspend_forward.py" name="freicar_$(arg name)_suspend_forward" output="screen">
+   <param name="~agent_name" value="$(arg name)" />
+  </node> 
+
+
+</launch>

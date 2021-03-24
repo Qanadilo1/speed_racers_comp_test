@@ -32,7 +32,7 @@ from freicar_bb_box_sr.msg import bb
 # from image_boundingb.msg import bb as bb_msg
 
 
-
+'''
 ap = argparse.ArgumentParser()
 ap.add_argument('-p', '--project', type=str, default='freicar-detection', help='project file that contains parameters')
 ap.add_argument('-c', '--compound_coef', type=int, default=0, help='coefficients of efficientdet')
@@ -42,14 +42,14 @@ ap.add_argument('--nms_threshold', type=float, default=0.5,
 ap.add_argument('--cuda', type=boolean_string, default=True)
 ap.add_argument('--device', type=int, default=0)
 args = ap.parse_args()
+'''
+compound_coef = 0
+nms_threshold = 0.5
+use_cuda = True
+gpu = 0
 
-compound_coef = args.compound_coef
-nms_threshold = args.nms_threshold
-use_cuda = args.cuda
-gpu = args.device
-
-project_name = args.project
-weights_path = args.weights
+project_name = 'freicar-detection'
+weights_path = 'logs/freicar-detection/efficientdet-d0_95_166000.pth'
 import os, sys
 here = os.path.dirname(os.path.abspath('/home/freicar/freicar_ws/src/speed_racers_comp_test/freicar_bb_box_sr/src/projects/'))
 sys.path.append(here)

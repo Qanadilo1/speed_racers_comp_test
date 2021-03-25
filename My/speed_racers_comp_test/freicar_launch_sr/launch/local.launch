@@ -1,0 +1,17 @@
+<launch>
+<arg name="ignore_suspensions" default="true"/>
+
+<node name="simulator" pkg="freicar_launch" type="start_sim.sh" output="screen" />
+<param name="map_path" value="/home/freicar/freicar_ws/src/freicar_base/freicar_map/maps/freicar_race_1.aismap" />
+<param name="comp_mode" value="true" />
+
+  <node pkg="freicar_setting" type="freicar_setting_node" name="sim_setting" output="screen" launch-prefix="bash -c 'sleep 20.0; $0 $@' ">
+  </node>
+
+  <node pkg="freicar_chaperone" type="chaperone" name="chaperone" launch-prefix="bash -c 'sleep 30.0; $0 $@' ">
+  <param name="ignore_suspensions" value="$(arg ignore_suspensions)"/>
+  <param name="max_collision_time" value="1.0"/>
+  </node>
+
+</launch>
+

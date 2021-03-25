@@ -1,0 +1,19 @@
+<launch>
+<node name="simulator" pkg="freicar_launch" type="start_sim.sh" output="screen" />
+<param name="map_path" value="/home/freicar/freicar_ws/src/freicar_base/freicar_map/maps/freicar_race_1.aismap" />
+<param name="comp_mode" value="true" />
+
+  <node pkg="freicar_setting" type="freicar_setting_node" name="sim_setting" output="screen" launch-prefix="bash -c 'sleep 20.0; $0 $@' ">
+  </node>
+
+  <node pkg="freicar_chaperone" type="chaperone" name="chaperone" launch-prefix="bash -c 'sleep 30.0; $0 $@' ">
+  </node>
+
+  <node pkg="freicar_map" type="freicar_map_node" name="freicar_map" launch-prefix="bash -c 'sleep 31.1; $0 $@' ">
+  </node>
+
+  <node pkg="timed_roslaunch" type="timed_roslaunch.sh"
+    args="32 freicar_agent sim_agent.launch name:=freicar_1 tf_name:=freicar_1 spawn/x:=0 spawn/y:=0 spawn/z:=0 spawn/heading:=20 use_yaml_spawn:=true sync_topic:=!" 
+    name="timed_roslaunch_1" output="screen" />
+
+</launch>

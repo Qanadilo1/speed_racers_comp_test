@@ -1,0 +1,11 @@
+numpy==1.16.0
+
+pyyaml
+webcolors
+matplotlib
+
+torch
+torchvision
+
+webcolors
+visdom

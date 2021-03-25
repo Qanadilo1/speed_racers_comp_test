@@ -1,0 +1,18 @@
+<launch>
+
+<include file="$(find realsense2_camera)/launch/rs_d435_and_t265.launch" />
+
+<include file="$(find zed_wrapper)/launch/zed_no_tf.launch" />
+
+
+<node name="dynset1" pkg="dynamic_reconfigure" type="dynparam" args="set /camera/rgb_camera enable_auto_exposure False" launch-prefix="bash -c 'sleep 30.0; $0 $@' "/>
+<node name="dynset2" pkg="dynamic_reconfigure" type="dynparam" args="set /camera/rgb_camera exposure 10" launch-prefix="bash -c 'sleep 31.0; $0 $@' "/>
+<node name="dynset6" pkg="dynamic_reconfigure" type="dynparam" args="set /camera/rgb_camera gain 100" launch-prefix="bash -c 'sleep 32.0; $0 $@' "/>
+
+<node name="dynset3" pkg="dynamic_reconfigure" type="dynparam" args="set /zed_node auto_exposure_gain False" launch-prefix="bash -c 'sleep 20.0; $0 $@' " output="screen"/>
+<node name="dynset4" pkg="dynamic_reconfigure" type="dynparam" args="set /zed_node exposure 4" launch-prefix="bash -c 'sleep 25.0; $0 $@' " output="screen"/>
+<node name="dynset5" pkg="dynamic_reconfigure" type="dynparam" args="set /zed_node auto_exposure_gain True" launch-prefix="bash -c 'sleep 27.0; $0 $@' " output="screen"/>
+<node name="dynset6" pkg="dynamic_reconfigure" type="dynparam" args="set /zed_node auto_exposure_gain False" launch-prefix="bash -c 'sleep 30.0; $0 $@' " output="screen"/>
+
+
+</launch>

@@ -1,0 +1,8 @@
+prefix=/home/freicar/freicar_ws/src/speed_racers_comp_test/freicar_map_sr/cmake-build-debug/devel
+
+Name: freicar_map_sr
+Description: Description of freicar_map_sr
+Version: 0.0.0
+Cflags: -I/home/freicar/freicar_ws/src/speed_racers_comp_test/freicar_map_sr/include -I/home/freicar/freicar_ws/src/speed_racers_comp_test/freicar_map_sr/MapThrift -I/home/freicar/freicar_ws/src/speed_racers_comp_test/freicar_map_sr/MapCore/include
+Libs: -L${prefix}/lib -lfreicar_globalmap -lfreicar_map_framework
+Requires: roscpp roslib visualization_msgs freicar_common raiscar_msgs

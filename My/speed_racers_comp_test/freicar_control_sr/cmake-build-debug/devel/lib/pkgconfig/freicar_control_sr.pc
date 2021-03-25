@@ -1,0 +1,8 @@
+prefix=/home/freicar/freicar_ws/src/speed_racers_comp_test/freicar_control_sr/cmake-build-debug/devel
+
+Name: freicar_control_sr
+Description: Description of freicar_control_sr
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

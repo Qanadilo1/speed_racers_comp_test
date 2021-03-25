@@ -1,0 +1,3 @@
+<launch>
+<node pkg="freicar_bb_box_sr" type="img_sub_bb_pub.py" name="bb_box" output="screen"/>
+</launch>

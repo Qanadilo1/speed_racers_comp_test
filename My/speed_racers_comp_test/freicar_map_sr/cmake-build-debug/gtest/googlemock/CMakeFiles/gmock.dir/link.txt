@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O0 -g -Wall -Wextra -g  -shared -Wl,-soname,libgmockd.so -o ../../lib/libgmockd.so CMakeFiles/gmock.dir/src/gmock-all.cc.o  -Wl,-rpath,/home/freicar/freicar_ws/src/speed_racers_comp_test/freicar_map_sr/cmake-build-debug/lib ../../lib/libgtestd.so -lpthread 

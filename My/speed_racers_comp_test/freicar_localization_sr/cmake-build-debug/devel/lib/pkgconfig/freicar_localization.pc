@@ -1,0 +1,8 @@
+prefix=/home/freicar/freicar_ws/src/freicar-2020-exercises/02-01-localization-exercise/freicar_localization/cmake-build-debug/devel
+
+Name: freicar_localization
+Description: Description of freicar_localization
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: roscpp rospy sensor_msgs std_msgs freicar_sign_detect freicar_common freicar_map tf_conversions

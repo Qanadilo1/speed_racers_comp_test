@@ -1,0 +1,3 @@
+<launch>
+<node pkg="freicar_control_sr" name="depth_nodereal" type="/scripts/depth_nodereal.py" output="screen"/>
+</launch>
